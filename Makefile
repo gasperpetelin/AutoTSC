@@ -1,0 +1,27 @@
+.PHONY: help list update tests clean format
+.ONESHELL:
+
+help:   ## Show available commands
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
+
+setup:  ## Sets up everything needed for a new deployment
+	uv venv --python 3.12
+	uv pip install -r requirements.txt
+
+list:
+	@LC_ALL=C $(MAKE) -pRrq -f $(firstword $(MAKEFILE_LIST)) : 2>/dev/null | awk -v RS= -F: '/(^|\n)# Files(\n|$$)/,/(^|\n)# Finished Make data base/ {if ($$1 !~ "^[#.]") {print $$1}}' | sort | grep -E -v -e '^[^[:alnum:]]' -e '^$@$$'
+
+clean: ## Removes env, docs and caches
+	rm -rf build/docs
+	rm -rf ~/.exturion
+	rm -rf .venv
+	uv clean all
+	uv cache clean
+
+tests: ## Run the unit tests
+	uv run pytest tests/ -vv -W ignore::DeprecationWarning --capture=no --durations=0 --cache-clear --maxfail=1
+
+format: ## Format the code with isort and ruff
+	uv run isort . --profile black
+	uv run ruff format .
+	uv run ruff check . --fix
