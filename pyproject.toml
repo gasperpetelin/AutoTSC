@@ -1,0 +1,58 @@
+[project]
+name = "autotsc"
+version = "0.1.0"
+description = "Automatic Time Series Classification"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "polars>=1.31.0",
+    "scikit-learn",
+    "tqdm",
+    "aeon[dl]>=1.3.0",
+    "tensorflow[and-cuda]>=2.14",
+    "seaborn",
+    "torch",
+    "tabpfn",
+    "huggingface-hub",
+    "tsfresh",
+    "ray"
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "isort",
+    "pytest",
+]
+notebooks = [
+    "marimo[recommended]",
+    "jupyter",
+    "jupyterlab",
+    "ipykernel",
+    "papermill"
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["autotsc"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = []
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
