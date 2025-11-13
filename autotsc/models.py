@@ -31,6 +31,35 @@ from aeon.transformations.collection.base import BaseCollectionTransformer
 from aeon.pipeline import make_pipeline as aeon_make_pipeline
 from aeon.transformations.series.smoothing import MovingAverage
 
+class CumSum(BaseCollectionTransformer):
+    """Cumulative sum transformer with pre-scaling (std) and post-scaling (max=1)."""
+
+    _tags = {
+        "capability:multivariate": True,
+        "X_inner_type": "numpy3D",
+        "fit_is_empty": True,
+    }
+
+    def __init__(self):
+        super().__init__()
+
+    def _transform(self, X, y=None):
+        """Transform X with shape (n_instances, n_channels, n_timesteps)."""
+        X = np.asarray(X, dtype=float)
+
+        std = X.std(axis=-1, keepdims=True)
+        std[std == 0] = 1  # avoid division by zero
+        X_scaled = X / std
+        X_shifted = X_scaled - X_scaled[..., [0]]
+        Xt = np.cumsum(X_shifted, axis=-1)
+
+        max_abs = np.max(np.abs(Xt), axis=-1, keepdims=True)
+        max_abs[max_abs == 0] = 1  # avoid division by zero
+        Xt = Xt / max_abs
+
+        Xt = Xt - Xt[..., [0]]
+        return Xt
+
 class Difference(BaseCollectionTransformer):
     _tags = {
         "capability:multivariate": True,
@@ -47,13 +76,11 @@ class Difference(BaseCollectionTransformer):
         if self.lag <= 0:
             raise ValueError(f"lag must be > 0, got {self.lag}")
 
-        # X shape: (n_instances, n_channels, n_timesteps)
-        # Apply difference along time axis (axis=2)
         Xt = X[:, :, self.lag:] - X[:, :, :-self.lag]
         return Xt
 
 
-@ray.remote(num_cpus=2)
+@ray.remote(num_cpus=4)
 def train_fold(model_id, classifier, fold_id, X, y, folds):
     selected_fold = folds.filter(pl.col("fold") == fold_id).to_dicts()[0]
     train_idx = selected_fold['train_idx']
@@ -67,11 +94,11 @@ def train_fold(model_id, classifier, fold_id, X, y, folds):
     classifier.fit(X_train, y_train)
     end_time = perf_counter()
     training_time = end_time - start_time
-    print(f"Model {repr(classifier).replace('\n', '').replace(' ', '')} Fold {fold_id} trained in {training_time:.2f} seconds")
+    # print(f"Model {repr(classifier).replace('\n', '').replace(' ', '')} Fold {fold_id} trained in {training_time:.2f} seconds")
 
     y_pred = classifier.predict(X_test)
     y_pred_zip = zip(test_idx, y_pred.tolist())
-    return model_id, classifier, y_pred_zip
+    return model_id, classifier, y_pred_zip, training_time
 
 class AutoTSCModel2(BaseClassifier):
     # TODO: change capability tags
@@ -92,20 +119,19 @@ class AutoTSCModel2(BaseClassifier):
         self.n_folds = n_folds
         self.verbose = verbose
 
-        self.models_ = []
+        self.models_ = {}
         self.summary_ = []
 
-        # Each model uses 2 jobs, Ray has 8 CPUs, so 4 models can run concurrently
         model_n_jobs = 4
 
         model_creators = [
             #lambda: DrCIFClassifier(n_jobs=model_n_jobs, time_limit_in_minutes=1),
             lambda: FreshPRINCEClassifier(n_jobs=model_n_jobs, default_fc_parameters="minimal"),
             lambda: SummaryClassifier(),
-            #lambda: aeon_make_pipeline(
-            #    Difference(),
-            #    SummaryClassifier()
-            #),
+            lambda: aeon_make_pipeline(
+                Difference(),
+                SummaryClassifier()
+            ),
             lambda: SklearnClassifierWrapper(
                 make_pipeline(
                     StandardScaler(),
@@ -131,6 +157,10 @@ class AutoTSCModel2(BaseClassifier):
                 Difference(),
                 Catch22Classifier()
             ),
+            lambda: aeon_make_pipeline(
+                CumSum(),
+                Catch22Classifier()
+            ),
             lambda: MultiRocketClassifier(n_jobs=model_n_jobs, random_state=1),
             lambda: MiniRocketClassifier(n_jobs=model_n_jobs, random_state=1),
             lambda: MultiRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=20000),
@@ -139,14 +169,14 @@ class AutoTSCModel2(BaseClassifier):
             lambda: MultiRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=50000),
             lambda: MiniRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=50000),
 
-            lambda: MultiRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=100000),
-            lambda: MiniRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=100000),
-
+            #lambda: MultiRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=100000),
+            #lambda: MiniRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=100000),
+#
             #lambda: MultiRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=200000),
             #lambda: MiniRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=200000),
-
-            #lambda: MultiRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=200000),
-            #lambda: MiniRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=200000),
+#
+            #lambda: MultiRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=500000),
+            #lambda: MiniRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=500000),
 
             #lambda: MultiRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=200000),
             #lambda: MiniRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=200000),
@@ -168,7 +198,7 @@ class AutoTSCModel2(BaseClassifier):
 
     def build_metamodel(self):
         from sklearn.preprocessing import OneHotEncoder
-        print("Building metamodel...")
+        # print("Building metamodel...")
         preds = []
         for fold_id in range(self.n_folds):
             selected_fold = self.folds_.filter(pl.col("fold") == fold_id).to_dicts()[0]
@@ -209,7 +239,7 @@ class AutoTSCModel2(BaseClassifier):
 
     def build_metamodel2(self):
         from sklearn.preprocessing import OneHotEncoder
-        print("Building metamodel...")
+        # print("Building metamodel...")
         preds = []
         for fold_id in range(self.n_folds):
             selected_fold = self.folds_.filter(pl.col("fold") == fold_id).to_dicts()[0]
@@ -251,8 +281,10 @@ class AutoTSCModel2(BaseClassifier):
 
 
         if self.verbose > 0:
-            # print Y, y statistics
-            print('Datase shape:', X.shape)
+            # print n samples. n channels, lengths and n classes
+            print('Number of samples:', X.shape[0])
+            print('Number of channels:', X.shape[1])
+            print('Length of series:', X.shape[2])
             print('Number of classes:', len(np.unique(y)))
 
             n_cpus_available = os.cpu_count() or 1
@@ -277,7 +309,6 @@ class AutoTSCModel2(BaseClassifier):
         
         tasks = []
         self.model_id = 0
-        model_training_start_time = perf_counter()
         for model_ in self.models:
             for fold in range(self.n_folds):
                 task = train_fold.remote(
@@ -293,13 +324,11 @@ class AutoTSCModel2(BaseClassifier):
 
         model_predictions = {}
         model_classfiers = {}
+        model_training_time = {}
 
         results = ray.get(tasks)
-        model_training_end_time = perf_counter()
-        training_duration = model_training_end_time - model_training_start_time
-        print(f"Trained models in {training_duration:.2f} seconds")
 
-        for model_id, model, y_pred in results:
+        for model_id, model, y_pred, model_duration in results:
             if model_id not in model_predictions:
                 model_predictions[model_id] = []
             model_predictions[model_id].extend(y_pred)
@@ -308,10 +337,14 @@ class AutoTSCModel2(BaseClassifier):
                 model_classfiers[model_id] = []
             model_classfiers[model_id].append(model)
 
+            if model_id not in model_training_time:
+                model_training_time[model_id] = []
+            model_training_time[model_id].append(model_duration)
+
         for model_id in model_predictions:
             fold_predictions = sorted(model_predictions[model_id])
             fold_predictions = [p[1] for p in fold_predictions]
-            self.models_.append(tuple(model_classfiers[model_id]))
+            self.models_[model_id] = (tuple(model_classfiers[model_id]))
             acc = accuracy_score(self.y_, fold_predictions)
 
             self.summary_.append({
@@ -320,10 +353,13 @@ class AutoTSCModel2(BaseClassifier):
                 'fold_predictions': fold_predictions,
                 'true_labels': self.y_.tolist(),
                 'validation_accuracy': acc,
+                'training_time_seconds': np.mean(model_training_time[model_id]),
             })
 
         self.build_metamodel()
         self.build_metamodel2()
+
+        self.use_models = self.models_.keys()
 
         ray.shutdown() 
         return self
@@ -342,19 +378,74 @@ class AutoTSCModel2(BaseClassifier):
             final_predictions.append(unique[counts.argmax()])
         return np.array(final_predictions)
 
+    def predict_per_model(self, X):
+        if len(self.models_) == 0:
+            raise ValueError("No models trained yet. Call fit().")
+
+        with ray.init(num_cpus=2*24, ignore_reinit_error=True, num_gpus=0):
+            tasks = []
+
+            for model_id, models in self.models_.items():
+                for model in models:
+                    task = make_prediction.remote(model_id, model, X)
+                    tasks.append(task)
+
+            all_model_predictions = {}
+            results = ray.get(tasks)
+            for model_id, predictions in results:
+                if model_id not in all_model_predictions:
+                    all_model_predictions[model_id] = []
+                all_model_predictions[model_id].append(list(predictions))
+
+            for model_id in all_model_predictions:
+                model_preds = np.array(all_model_predictions[model_id])
+                all_model_predictions[model_id] = self.most_common_label(np.array(model_preds))
+
+            return all_model_predictions
+
     def _predict(self, X):
         if len(self.models_) == 0:
             raise ValueError("No models trained yet. Call fit().")
 
-        all_predictions = []
-        for models in self.models_:
-            for model in models:
-                predictions = model.predict(X)
+        with ray.init(num_cpus=2*24, ignore_reinit_error=True, num_gpus=0):
+            tasks = []
+            c = 0
+            for model_id, models in self.models_.items():
+                # train all models if use_models is None
+                # if not None, only use models in the list
+                if model_id not in self.use_models:
+                    continue
+                for model in models:
+                    task = make_prediction.remote(c, model, X)
+                    tasks.append(task)
+                    c+=1
+
+            all_predictions = []
+            results = ray.get(tasks)
+            results = sorted(results, key=lambda x: x[0])
+            for order, predictions in results:
                 all_predictions.append(predictions)
 
-        all_predictions = np.array(all_predictions)
-        return self.most_common_label(all_predictions)
+            all_predictions = np.array(all_predictions)
+            return self.most_common_label(all_predictions)
     
+
+@ray.remote(num_cpus=4)
+def make_prediction(order, model, X):
+    start_time = perf_counter()
+    pred =  model.predict(X)
+    end_time = perf_counter()
+    prediction_time = end_time - start_time
+    return order, pred
+
+
+
+
+
+
+
+
+
 class AutoTSCModel(BaseClassifier):
 
     # TODO: change capability tags
