@@ -19,9 +19,9 @@ clean: ## Removes env, docs and caches
 	uv cache clean
 
 tests: ## Run the unit tests
-	uv run pytest tests/ -vv -W ignore::DeprecationWarning --capture=no --durations=0 --cache-clear --maxfail=1
+	uv run --extra dev pytest tests/ -vv -W ignore::DeprecationWarning --capture=no --durations=0 --cache-clear --maxfail=1
 
 format: ## Format the code with isort and ruff
-	uv run isort . --profile black
-	uv run ruff format .
-	uv run ruff check . --fix
+	uv run --extra dev isort . --profile black
+	uv run --extra dev ruff format .
+	uv run --extra dev ruff check . --fix
