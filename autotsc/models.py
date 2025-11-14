@@ -10,7 +10,7 @@ from sklearn.metrics import accuracy_score
 from joblib import Parallel, delayed
 import polars as pl
 import numpy as np
-from autotsc.utils import load_dataset
+from autotsc import utils, transformers
 import os
 import time
 from aeon.classification.convolution_based import RocketClassifier, MultiRocketClassifier, MiniRocketClassifier
@@ -30,54 +30,153 @@ import ray
 from aeon.transformations.collection.base import BaseCollectionTransformer
 from aeon.pipeline import make_pipeline as aeon_make_pipeline
 from aeon.transformations.series.smoothing import MovingAverage
+from aeon.classification.dummy import DummyClassifier
+from aeon.classification.shapelet_based import ShapeletTransformClassifier
+from aeon.classification.interval_based import DrCIFClassifier
+from aeon.classification.interval_based import QUANTClassifier
+from aeon.classification.interval_based import TimeSeriesForestClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier
+from aeon.transformations.collection import DownsampleTransformer
 
-class CumSum(BaseCollectionTransformer):
-    """Cumulative sum transformer with pre-scaling (std) and post-scaling (max=1)."""
+class RidgeClassifierCVWithProba(RidgeClassifierCV):
+    def predict_proba(self, X):
+        return self._predict_proba_lr(X)
 
-    _tags = {
-        "capability:multivariate": True,
-        "X_inner_type": "numpy3D",
-        "fit_is_empty": True,
-    }
 
-    def __init__(self):
-        super().__init__()
+def default_model_creators(model_n_jobs=4):
+    return [
+        # === Priority 1: Fast Baselines (always run first) ===
+        lambda: aeon_make_pipeline(
+            DownsampleTransformer(downsample_by='proportion', proportion=0.2), MultiRocketClassifier(n_jobs=model_n_jobs, random_state=6, n_kernels=500, estimator=RidgeClassifierCVWithProba(alphas=np.logspace(-3, 3, 10))),
+        ),
+        lambda: aeon_make_pipeline(
+            DownsampleTransformer(downsample_by='proportion', proportion=0.5), MiniRocketClassifier(n_jobs=model_n_jobs, random_state=6, n_kernels=500, estimator=RidgeClassifierCVWithProba(alphas=np.logspace(-3, 3, 10))),
+        ),
 
-    def _transform(self, X, y=None):
-        """Transform X with shape (n_instances, n_channels, n_timesteps)."""
-        X = np.asarray(X, dtype=float)
+        lambda: DummyClassifier(),  # Baseline reference
+        lambda: SklearnClassifierWrapper(
+            make_pipeline(
+                StandardScaler(),
+                RidgeClassifierCVWithProba(alphas=np.logspace(-3, 3, 10))
+            )
+        ),
+        lambda: SummaryClassifier(),  # Fast feature-based
+        lambda: SklearnClassifierWrapper(
+            RandomForestClassifier(n_estimators=100, n_jobs=model_n_jobs)
+        ),
 
-        std = X.std(axis=-1, keepdims=True)
-        std[std == 0] = 1  # avoid division by zero
-        X_scaled = X / std
-        X_shifted = X_scaled - X_scaled[..., [0]]
-        Xt = np.cumsum(X_shifted, axis=-1)
+        # === Priority 2: Core ROCKET Models (best quality/speed tradeoff) ===
+        lambda: MultiRocketClassifier(
+            n_jobs=model_n_jobs, random_state=0, n_kernels=500,
+            estimator=RidgeClassifierCVWithProba(alphas=np.logspace(-3, 3, 10))
+        ),
+        lambda: MiniRocketClassifier(
+            n_jobs=model_n_jobs, random_state=0, n_kernels=500,
+            estimator=RidgeClassifierCVWithProba(alphas=np.logspace(-3, 3, 10))
+        ),
 
-        max_abs = np.max(np.abs(Xt), axis=-1, keepdims=True)
-        max_abs[max_abs == 0] = 1  # avoid division by zero
-        Xt = Xt / max_abs
+        # === Priority 3: Ensemble Diversity (multiple seeds) ===
+        lambda: MultiRocketClassifier(
+            n_jobs=model_n_jobs, random_state=2, n_kernels=500,
+            estimator=RidgeClassifierCVWithProba(alphas=np.logspace(-3, 3, 10))
+        ),
+        lambda: MiniRocketClassifier(
+            n_jobs=model_n_jobs, random_state=2, n_kernels=500,
+            estimator=RidgeClassifierCVWithProba(alphas=np.logspace(-3, 3, 10))
+        ),
+        lambda: MultiRocketClassifier(
+            n_jobs=model_n_jobs, random_state=3, n_kernels=500,
+            estimator=RidgeClassifierCVWithProba(alphas=np.logspace(-3, 3, 10))
+        ),
+        lambda: MiniRocketClassifier(
+            n_jobs=model_n_jobs, random_state=3, n_kernels=500,
+            estimator=RidgeClassifierCVWithProba(alphas=np.logspace(-3, 3, 10))
+        ),
+        lambda: MultiRocketClassifier(
+            n_jobs=model_n_jobs, random_state=4, n_kernels=500,
+            estimator=RidgeClassifierCVWithProba(alphas=np.logspace(-3, 3, 10))
+        ),
+        lambda: MiniRocketClassifier(
+            n_jobs=model_n_jobs, random_state=4, n_kernels=500,
+            estimator=RidgeClassifierCVWithProba(alphas=np.logspace(-3, 3, 10))
+        ),
+        lambda: MultiRocketClassifier(
+            n_jobs=model_n_jobs, random_state=5, n_kernels=500,
+            estimator=RidgeClassifierCVWithProba(alphas=np.logspace(-3, 3, 10))
+        ),
+        lambda: MiniRocketClassifier(
+            n_jobs=model_n_jobs, random_state=5, n_kernels=500,
+            estimator=RidgeClassifierCVWithProba(alphas=np.logspace(-3, 3, 10))
+        ),
 
-        Xt = Xt - Xt[..., [0]]
-        return Xt
+        # === Priority 4: Transformed Features ===
+        lambda: aeon_make_pipeline(
+            transformers.Difference(),
+            SummaryClassifier()
+        ),
+        lambda: aeon_make_pipeline(
+            transformers.Difference(),
+            MultiRocketClassifier(
+                n_jobs=model_n_jobs, random_state=6, n_kernels=500,
+                estimator=RidgeClassifierCVWithProba(alphas=np.logspace(-3, 3, 10))
+            )
+        ),
+        lambda: aeon_make_pipeline(
+            transformers.Difference(),
+            MiniRocketClassifier(
+                n_jobs=model_n_jobs, random_state=6, n_kernels=500,
+                estimator=RidgeClassifierCVWithProba(alphas=np.logspace(-3, 3, 10))
+            )
+        ),
 
-class Difference(BaseCollectionTransformer):
-    _tags = {
-        "capability:multivariate": True,
-        "X_inner_type": "numpy3D",
-        "fit_is_empty": True,
-    }
+        # === Priority 5: Feature-Based Models ===
+        lambda: Catch22Classifier(n_jobs=model_n_jobs),
+        lambda: aeon_make_pipeline(
+            transformers.Difference(),
+            Catch22Classifier()
+        ),
+        lambda: QUANTClassifier(random_state=1),
+        lambda: QUANTClassifier(
+            random_state=2,
+            estimator=RidgeClassifierCVWithProba(alphas=np.logspace(-3, 3, 10))
+        ),
 
-    def __init__(self, lag: int = 1) -> None:
-        self.lag = lag
-        super().__init__()
+        # === Priority 6: CumSum Transformations ===
+        lambda: aeon_make_pipeline(
+            transformers.CumSum(),
+            MultiRocketClassifier(
+                n_jobs=model_n_jobs, random_state=6, n_kernels=500,
+                estimator=RidgeClassifierCVWithProba(alphas=np.logspace(-3, 3, 10))
+            )
+        ),
+        lambda: aeon_make_pipeline(
+            transformers.CumSum(),
+            MiniRocketClassifier(
+                n_jobs=model_n_jobs, random_state=6, n_kernels=500,
+                estimator=RidgeClassifierCVWithProba(alphas=np.logspace(-3, 3, 10))
+            )
+        ),
+        lambda: aeon_make_pipeline(
+            transformers.CumSum(),
+            Catch22Classifier()
+        ),
 
-    def _transform(self, X, y=None):
-        """Transform X with shape (n_instances, n_channels, n_timesteps)."""
-        if self.lag <= 0:
-            raise ValueError(f"lag must be > 0, got {self.lag}")
+        # === Priority 7: Expensive/Experimental Models (lowest priority) ===
+        lambda: SklearnClassifierWrapper(
+            RandomForestClassifier(n_estimators=100, n_jobs=model_n_jobs, ccp_alpha=0.001)
+        ),
+        lambda: SklearnClassifierWrapper(
+            RandomForestClassifier(n_estimators=100, n_jobs=model_n_jobs, ccp_alpha=0.01)
+        ),
 
-        Xt = X[:, :, self.lag:] - X[:, :, :-self.lag]
-        return Xt
+        # === Very expensive models (commented out, uncomment if needed) ===
+        # lambda: DrCIFClassifier(n_jobs=model_n_jobs, time_limit_in_minutes=0.5),
+        # lambda: FreshPRINCEClassifier(n_jobs=model_n_jobs, default_fc_parameters="minimal"),
+        # lambda: SklearnClassifierWrapper(TabPFNClassifier(n_preprocessing_jobs=model_n_jobs)),
+        # lambda: TimeSeriesForestClassifier(n_jobs=model_n_jobs, n_estimators=50, n_intervals='sqrt-div'),
+        # lambda: ProximityForest(n_jobs=model_n_jobs, max_depth=3, n_trees=5),
+        # lambda: TemporalDictionaryEnsemble(n_jobs=model_n_jobs),
+    ]
 
 
 @ray.remote(num_cpus=4)
@@ -94,11 +193,14 @@ def train_fold(model_id, classifier, fold_id, X, y, folds):
     classifier.fit(X_train, y_train)
     end_time = perf_counter()
     training_time = end_time - start_time
-    # print(f"Model {repr(classifier).replace('\n', '').replace(' ', '')} Fold {fold_id} trained in {training_time:.2f} seconds")
 
     y_pred = classifier.predict(X_test)
     y_pred_zip = zip(test_idx, y_pred.tolist())
-    return model_id, classifier, y_pred_zip, training_time
+
+    y_prob = classifier.predict_proba(X_test)
+    y_prob_zip = zip(test_idx, y_prob.tolist())
+
+    return model_id, classifier, y_pred_zip, y_prob_zip, training_time
 
 class AutoTSCModel2(BaseClassifier):
     # TODO: change capability tags
@@ -113,77 +215,18 @@ class AutoTSCModel2(BaseClassifier):
     def set_use_models(self, model_ids):
         self.use_models = model_ids
 
-    def __init__(self, n_jobs=-1, n_gpus=-1, n_folds=8, verbose=0):
+    def __init__(self, n_jobs=-1, n_gpus=-1, n_folds=8, verbose=0, model_n_jobs=4):
         self.n_jobs = n_jobs
         self.n_gpus = n_gpus
         self.n_folds = n_folds
         self.verbose = verbose
+        self.model_n_jobs = model_n_jobs
 
         self.models_ = {}
         self.summary_ = []
 
-        model_n_jobs = 4
-
-        model_creators = [
-            #lambda: DrCIFClassifier(n_jobs=model_n_jobs, time_limit_in_minutes=1),
-            lambda: FreshPRINCEClassifier(n_jobs=model_n_jobs, default_fc_parameters="minimal"),
-            lambda: SummaryClassifier(),
-            lambda: aeon_make_pipeline(
-                Difference(),
-                SummaryClassifier()
-            ),
-            lambda: SklearnClassifierWrapper(
-                make_pipeline(
-                    StandardScaler(),
-                    RidgeClassifierCV(alphas=np.logspace(-3, 3, 10))
-                )
-            ),
-            #lambda: SklearnClassifierWrapper(
-            #    TabPFNClassifier(n_preprocessing_jobs=model_n_jobs)
-            #),
-            lambda: SklearnClassifierWrapper(
-                RandomForestClassifier(n_estimators=100, n_jobs=model_n_jobs)
-            ),
-            lambda: SklearnClassifierWrapper(
-                RandomForestClassifier(n_estimators=100, n_jobs=model_n_jobs, ccp_alpha=0.01)
-            ),
-            lambda: SklearnClassifierWrapper(
-                RandomForestClassifier(n_estimators=100, n_jobs=model_n_jobs, ccp_alpha=0.001)
-            ),
-            lambda: MultiRocketClassifier(n_jobs=model_n_jobs, random_state=0, n_kernels=2000),
-            lambda: MiniRocketClassifier(n_jobs=model_n_jobs, random_state=0, n_kernels=2000),
-            lambda: Catch22Classifier(n_jobs=model_n_jobs),
-            lambda: aeon_make_pipeline(
-                Difference(),
-                Catch22Classifier()
-            ),
-            lambda: aeon_make_pipeline(
-                CumSum(),
-                Catch22Classifier()
-            ),
-            lambda: MultiRocketClassifier(n_jobs=model_n_jobs, random_state=1),
-            lambda: MiniRocketClassifier(n_jobs=model_n_jobs, random_state=1),
-            lambda: MultiRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=20000),
-            lambda: MiniRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=20000),
-
-            lambda: MultiRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=50000),
-            lambda: MiniRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=50000),
-
-            #lambda: MultiRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=100000),
-            #lambda: MiniRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=100000),
-#
-            #lambda: MultiRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=200000),
-            #lambda: MiniRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=200000),
-#
-            #lambda: MultiRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=500000),
-            #lambda: MiniRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=500000),
-
-            #lambda: MultiRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=200000),
-            #lambda: MiniRocketClassifier(n_jobs=model_n_jobs, random_state=1, n_kernels=200000),
-
-            #lambda: ProximityForest(n_jobs=model_n_jobs, max_depth=3, n_trees=5),
-            # lambda: TemporalDictionaryEnsemble(n_jobs=model_n_jobs),
-        ]
+        # Get model creators in priority order
+        model_creators = default_model_creators(model_n_jobs=model_n_jobs)
 
         self.models = []
         for creator in model_creators:
@@ -192,120 +235,74 @@ class AutoTSCModel2(BaseClassifier):
                 self.models.append(model)
             except Exception as e:
                 model_name = str(e).split("'")[1] if "'" in str(e) else type(e).__name__
-                print(f"Skipping model due to failed initialization: {model_name}")
+                if self.verbose > 0:
+                    print(f"Skipping model due to failed initialization: {model_name}")
 
         super().__init__()
 
-    def build_metamodel(self):
-        from sklearn.preprocessing import OneHotEncoder
-        # print("Building metamodel...")
+    def build_metamodel(self, classifier, model_id):
         preds = []
+        models = []
         for fold_id in range(self.n_folds):
             selected_fold = self.folds_.filter(pl.col("fold") == fold_id).to_dicts()[0]
             train_idx = selected_fold['train_idx']
             test_idx = selected_fold['test_idx']
 
             X = []
+            X_proba = []
             y = []
-            for row in self.summary().iter_rows(named=True):
+            for row in self.summary().filter(pl.col('stacking_level')==0).sort('model_id').iter_rows(named=True):
                 X.append(row['fold_predictions'])
                 y = row['true_labels']
+                X_proba.append(np.array(row['fold_probabilities']))
             X = np.array(X).T
             y = np.array(y)
+            X_proba = np.hstack(X_proba)
+            X = X_proba
 
             X_train = X[train_idx]
             X_test = X[test_idx]
             y_train = y[train_idx]
 
-            pipeline = Pipeline([
-                ('encoder', OneHotEncoder(sparse_output=False)),
-                ('classifier', RidgeClassifierCV())
-            ])
+            pipeline = clone(classifier)
             pipeline.fit(X_train, y_train)
             y_pred = pipeline.predict(X_test)
 
             preds.extend(zip(test_idx, y_pred.tolist()))
+            models.append(pipeline)
+
+        # Compute OOF predictions and accuracy for this meta-model
         fold_predictions = sorted(preds)
         fold_predictions = [p[1] for p in fold_predictions]
         acc = accuracy_score(self.y_, fold_predictions)
+
         self.summary_.append({
-            'model_id': self.model_id,
-            'classifier': repr(pipeline).replace('\n', '').replace(' ', ''),
+            'model_id': model_id,
+            'classifier': repr(classifier).replace('\n', '').replace(' ', ''),
             'fold_predictions': fold_predictions,
             'true_labels': self.y_.tolist(),
             'validation_accuracy': acc,
+            'stacking_level': 1,
         })
         self.model_id += 1
+        return models
 
-    def build_metamodel2(self):
-        from sklearn.preprocessing import OneHotEncoder
-        # print("Building metamodel...")
-        preds = []
-        for fold_id in range(self.n_folds):
-            selected_fold = self.folds_.filter(pl.col("fold") == fold_id).to_dicts()[0]
-            train_idx = selected_fold['train_idx']
-            test_idx = selected_fold['test_idx']
-
-            X = []
-            y = []
-            for row in self.summary().iter_rows(named=True):
-                X.append(row['fold_predictions'])
-                y = row['true_labels']
-            X = np.array(X).T
-            y = np.array(y)
-
-            X_train = X[train_idx]
-            X_test = X[test_idx]
-            y_train = y[train_idx]
-
-            pipeline = RandomForestClassifier(n_estimators=300, n_jobs=self.n_jobs)
-            pipeline.fit(X_train, y_train)
-            y_pred = pipeline.predict(X_test)
-
-            preds.extend(zip(test_idx, y_pred.tolist()))
-        fold_predictions = sorted(preds)
-        fold_predictions = [p[1] for p in fold_predictions]
-        acc = accuracy_score(self.y_, fold_predictions)
-        self.summary_.append({
-            'model_id': self.model_id,
-            'classifier': repr(pipeline).replace('\n', '').replace(' ', ''),
-            'fold_predictions': fold_predictions,
-            'true_labels': self.y_.tolist(),
-            'validation_accuracy': acc,
-        })
-        self.model_id += 1
-
+    def save_X_y(self, X, y):
+        self.X_, self.y_ = X, y
 
     def _fit(self, X, y):
-        ray.init(num_cpus=24, ignore_reinit_error=True, num_gpus=0)
+        self.cpus_available_, self.cpus_to_use_, self.gpus_available_, self.gpus_to_use_  = utils.get_resource_config(self.n_jobs, self.n_gpus)
+        self.save_X_y(X=X, y=y)
 
+        ray.init(num_cpus=self.cpus_to_use_, ignore_reinit_error=True, num_gpus=self.gpus_to_use_)
 
         if self.verbose > 0:
-            # print n samples. n channels, lengths and n classes
-            print('Number of samples:', X.shape[0])
-            print('Number of channels:', X.shape[1])
-            print('Length of series:', X.shape[2])
-            print('Number of classes:', len(np.unique(y)))
-
-            n_cpus_available = os.cpu_count() or 1
-            n_cpus_to_use = n_cpus_available if self.n_jobs == -1 else self.n_jobs
-            print(f"CPUs: {n_cpus_to_use}/{n_cpus_available}")
-
-            n_gpus_available = len(tf.config.list_physical_devices('GPU'))
-            n_gpus_to_use = n_gpus_available if self.n_jobs == -1 else min(self.n_jobs, n_gpus_available)
-            print(f"GPUs: {n_gpus_to_use}/{n_gpus_available}")
-
-        self.X_ = X
-        self.y_ = y
-        self.folds_ = []
-        skf = StratifiedKFold(n_splits=self.n_folds, shuffle=True)
-        for i, (train_idx, test_idx) in enumerate(skf.split(X, y)):
-            self.folds_.append({
-                'fold': i,
-                'train_idx': train_idx,
-                'test_idx': test_idx,
-            })
-        self.folds_ = pl.DataFrame(self.folds_)
+            utils.print_fit_start_info(
+                self.X_, self.y_,
+                self.cpus_to_use_, self.cpus_available_,
+                self.gpus_to_use_, self.gpus_available_
+            )
+        self.folds_ = utils.generate_fold_indices(X, y, n_folds=self.n_folds, shuffle=True)
         
         tasks = []
         self.model_id = 0
@@ -323,12 +320,13 @@ class AutoTSCModel2(BaseClassifier):
             self.model_id += 1
 
         model_predictions = {}
+        model_probabilities = {}
         model_classfiers = {}
         model_training_time = {}
 
         results = ray.get(tasks)
 
-        for model_id, model, y_pred, model_duration in results:
+        for model_id, model, y_pred, y_prob, model_duration in results:
             if model_id not in model_predictions:
                 model_predictions[model_id] = []
             model_predictions[model_id].extend(y_pred)
@@ -341,9 +339,16 @@ class AutoTSCModel2(BaseClassifier):
                 model_training_time[model_id] = []
             model_training_time[model_id].append(model_duration)
 
+            if model_id not in model_probabilities:
+                model_probabilities[model_id] = []
+            model_probabilities[model_id].extend(y_prob)
+
         for model_id in model_predictions:
             fold_predictions = sorted(model_predictions[model_id])
+            fold_probabilities = sorted(model_probabilities[model_id])
             fold_predictions = [p[1] for p in fold_predictions]
+            fold_probabilities = [p[1] for p in fold_probabilities]
+
             self.models_[model_id] = (tuple(model_classfiers[model_id]))
             acc = accuracy_score(self.y_, fold_predictions)
 
@@ -351,13 +356,31 @@ class AutoTSCModel2(BaseClassifier):
                 'model_id': model_id,
                 'classifier': repr(self.models[model_id]).replace('\n', '').replace(' ', ''),
                 'fold_predictions': fold_predictions,
+                'fold_probabilities': fold_probabilities,
                 'true_labels': self.y_.tolist(),
                 'validation_accuracy': acc,
                 'training_time_seconds': np.mean(model_training_time[model_id]),
+                'stacking_level': 0,
             })
 
-        self.build_metamodel()
-        self.build_metamodel2()
+        self.meta_models = {}
+
+        from sklearn.decomposition import PCA
+        pipeline = Pipeline([
+            ('pca', PCA(n_components=0.95)),  # 95% variance
+            ('classifier', RidgeClassifierCV(alphas=np.logspace(-3, 3, 10)))
+        ])
+
+        # Build meta-models with different classifiers
+        m1 = self.build_metamodel(RidgeClassifierCV(), 'ridge')
+        m2 = self.build_metamodel(RandomForestClassifier(n_estimators=500, n_jobs=self.n_jobs), 'rf')
+        m3 = self.build_metamodel(pipeline, 'pca-ridge')
+        m4 = self.build_metamodel(HistGradientBoostingClassifier(), 'hgb')
+
+
+        self.meta_models['ridge'] = tuple(m1)
+        self.meta_models['rf'] = tuple(m2)
+        self.meta_models['pca-ridge'] = tuple(m3)
 
         self.use_models = self.models_.keys()
 
@@ -378,11 +401,11 @@ class AutoTSCModel2(BaseClassifier):
             final_predictions.append(unique[counts.argmax()])
         return np.array(final_predictions)
 
-    def predict_per_model(self, X):
+    def predict_per_base_model(self, X):
         if len(self.models_) == 0:
             raise ValueError("No models trained yet. Call fit().")
 
-        with ray.init(num_cpus=2*24, ignore_reinit_error=True, num_gpus=0):
+        with ray.init(num_cpus=self.cpus_to_use_, ignore_reinit_error=True, num_gpus=self.gpus_to_use_):
             tasks = []
 
             for model_id, models in self.models_.items():
@@ -403,11 +426,56 @@ class AutoTSCModel2(BaseClassifier):
 
             return all_model_predictions
 
+    def predict_proba_per_model(self, X):
+        with ray.init(num_cpus=self.cpus_to_use_, ignore_reinit_error=True, num_gpus=self.gpus_to_use_):
+            tasks = []
+
+            for model_id, models in self.models_.items():
+                for model in models:
+                    task = make_prediction.remote(model_id, model, X, return_proba=True)
+                    tasks.append(task)
+
+            all_model_predictions = {}
+            results = list(ray.get(tasks))
+            for model_id, predictions, probabilities in results:
+                if model_id not in all_model_predictions:
+                    all_model_predictions[model_id] = []
+                all_model_predictions[model_id].append(list(probabilities))
+            for model_id in all_model_predictions:
+                model_probs = np.array(all_model_predictions[model_id])
+                avg_probs = np.mean(model_probs, axis=0)
+                all_model_predictions[model_id] = avg_probs
+            return all_model_predictions
+
+    def predict_per_model(self, X):
+        base_model_predictions = self.predict_per_base_model(X)
+        base_model_probabilities = self.predict_proba_per_model(X)
+
+        base_models = base_model_predictions.keys()
+        base_model = sorted(base_models)
+
+        X = []
+        for model_id in base_model:
+            X.append(base_model_probabilities[model_id])
+        X = np.hstack(X)
+
+        meta_model_predictions = {}
+
+        for model_id in self.meta_models.keys():
+            meta_model_predictions[model_id] = []
+            for m in self.meta_models[model_id]:
+                meta_model_pred = m.predict(X)
+                meta_model_predictions[model_id].append(list(meta_model_pred))
+            meta_model_predictions[model_id] = self.most_common_label(np.array(meta_model_predictions[model_id]))
+            base_model_predictions[model_id] = meta_model_predictions[model_id]
+
+        return base_model_predictions
+
     def _predict(self, X):
         if len(self.models_) == 0:
             raise ValueError("No models trained yet. Call fit().")
 
-        with ray.init(num_cpus=2*24, ignore_reinit_error=True, num_gpus=0):
+        with ray.init(num_cpus=self.cpus_to_use_, ignore_reinit_error=True, num_gpus=self.gpus_to_use_):
             tasks = []
             c = 0
             for model_id, models in self.models_.items():
@@ -431,14 +499,16 @@ class AutoTSCModel2(BaseClassifier):
     
 
 @ray.remote(num_cpus=4)
-def make_prediction(order, model, X):
+def make_prediction(order, model, X, return_proba=False):
     start_time = perf_counter()
     pred =  model.predict(X)
+    prob = model.predict_proba(X)
     end_time = perf_counter()
     prediction_time = end_time - start_time
-    return order, pred
-
-
+    if return_proba:
+        return order, pred, prob
+    else:
+        return order, pred
 
 
 
@@ -670,7 +740,7 @@ class AutoTSCModel(BaseClassifier):
 
 
 if __name__ == "__main__":
-    X_train, y_train, X_test, y_test = load_dataset("ArrowHead")
+    X_train, y_train, X_test, y_test = utils.load_dataset("ArrowHead")
     n_jobs = -1
     model = AutoTSCModel(verbose=1, n_jobs=n_jobs)
     model.fit(X_train, y_train)
