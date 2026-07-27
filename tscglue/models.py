@@ -2401,6 +2401,197 @@ class TSCGlueEnhanced(TSCGlueETAll):
         self.log("Fallback model trained successfully", level=1, start_time=fit_start_time)
 
 
+# Level-1 pools for TSCGlueEnhancedV2. ``high`` is the union of the plain and
+# balanced pools; ``probability-nn`` is a member of both (MLPClassifier has no
+# ``class_weight``, so there is no balanced counterpart to add), which is why the
+# union has 9 members and not 10.
+_ENHANCED_V2_PLAIN_STACKERS = list(TSCGlueBrierSelect.DEFAULT_STACKING_MODELS)
+_ENHANCED_V2_BALANCED_STACKERS = list(TSCGlueMeanBalanced.DEFAULT_STACKING_MODELS)
+_ENHANCED_V2_HIGH_STACKERS = _ENHANCED_V2_PLAIN_STACKERS + [
+    name for name in _ENHANCED_V2_BALANCED_STACKERS if name not in _ENHANCED_V2_PLAIN_STACKERS
+]
+
+# The served head for every (preset, eval_metric) pair. At ``medium``/``high``
+# every head is trained regardless, so eval_metric only picks which already
+# fitted head is served — no extra compute. At ``low`` a single stacker is
+# trained, so this table is also read in __init__ to decide *which* one.
+_ENHANCED_V2_SERVED_HEAD = {
+    ("low", "accuracy"): "probability-ridgecv",
+    ("low", "f1"): "probability-et",
+    ("low", "roc_auc"): "probability-et",
+    ("low", "log_loss"): "probability-et",
+    ("medium", "accuracy"): "probability-stack-mean",
+    ("medium", "f1"): "probability-stack-mean",
+    ("medium", "roc_auc"): "probability-stack-mean",
+    ("medium", "log_loss"): "probability-et",
+    ("high", "accuracy"): "probability-stack-mean-balanced",
+    ("high", "f1"): "probability-stack-mean-balanced",
+    ("high", "roc_auc"): "probability-stack-mean-balanced",
+    ("high", "log_loss"): "probability-et",
+}
+
+
+class TSCGlueEnhancedV2(TSCGlueETAll):
+    """Preset-composed TSCGlue stack whose served head also depends on ``eval_metric``.
+
+    Same three-preset composition axis as :class:`TSCGlueEnhanced`, but the
+    level-2 serving decision is a lookup on ``(preset, eval_metric)`` rather than
+    on ``preset`` alone, and ``high`` competes a second, class-weight-balanced
+    stack-mean instead of an ExtraTrees level-2 head.
+
+    ============ ============================ ========================= ==================================
+    preset       level 0 (base heads)         level 1 (stackers)        level 2 (served)
+    ============ ============================ ========================= ==================================
+    ``low``      4 reps, 1 head each          1, by ``eval_metric``     the single stacker, direct
+    ``medium``   6 reps, 1 head each          5 competing stackers      stack-mean, or ET for ``log_loss``
+    ``high``     6 reps, 2 heads each (12)    9 competing stackers      balanced stack-mean, or ET for ``log_loss``
+    ============ ============================ ========================= ==================================
+
+    The ``high`` level-1 pool is the plain five plus their four
+    ``class_weight="balanced"`` counterparts; ``probability-nn`` has no balanced
+    twin, so the pool is 9 models. Two means then compete: ``probability-stack-mean``
+    over the plain stackers and ``probability-stack-mean-balanced`` over the
+    balanced ones, each dropping its own ridge member (one-hot output would poison
+    the average). Both are scored and reported in ``summary()``; which one is
+    *served* comes from the table above.
+
+    ``probability-et-l2-all`` is never served by any pair, and — since
+    :meth:`TSCGlueET._select_best_model` is the only thing that fits it — never
+    trained. Everything falls back to MRHydraET when the stack cannot be built.
+    """
+
+    BALANCED_MEAN_STACKER_NAME = "probability-stack-mean-balanced"
+
+    # Both ridges are excluded from whichever mean they belong to; the pool
+    # passed to _mean_members decides which of the two means is being built.
+    MEAN_STACKER_EXCLUDE = ("probability-ridgecv", "probability-ridgecv-balanced")
+
+    def __init__(
+        self,
+        random_state=None,
+        k_folds=10,
+        n_jobs=1,
+        verbose=0,
+        n_repetitions=1,
+        n_gpus=0,
+        runs_dir=None,
+        eval_metric="accuracy",
+        preset="medium",
+    ):
+        assert n_gpus in (0, 1, -1), f"n_gpus must be 0, 1, or -1; got {n_gpus}"
+        assert eval_metric in _VALID_EVAL_METRICS, (
+            f"eval_metric must be one of {_VALID_EVAL_METRICS}; got {eval_metric!r}"
+        )
+        assert preset in _ENHANCED_PRESETS, (
+            f"preset must be one of {_ENHANCED_PRESETS}; got {preset!r}"
+        )
+        self.preset = preset
+
+        if preset == "low":
+            model_names = list(_ENHANCED_LOW_MODELS)
+            # Only one stacker is trained here, so the served head has to be
+            # known pre-fit rather than picked from fitted candidates.
+            stacking_models = [_ENHANCED_V2_SERVED_HEAD[(preset, eval_metric)]]
+        elif preset == "medium":
+            model_names = list(TSCGlueWeaselV2.DEFAULT_MODEL_NAMES)
+            stacking_models = list(_ENHANCED_V2_PLAIN_STACKERS)
+        else:  # high
+            model_names = list(TSCGlueDual.DEFAULT_MODEL_NAMES)
+            stacking_models = list(_ENHANCED_V2_HIGH_STACKERS)
+
+        # Skips the intermediate __init__s (they hardcode the pool/stackers this
+        # preset logic replaces), matching how TSCGlueEnhanced initialises.
+        LokyStackerV10RSTSFRandom.__init__(
+            self,
+            random_state=random_state,
+            n_repetitions=n_repetitions,
+            k_folds=k_folds,
+            n_jobs=n_jobs,
+            keep_features=False,
+            verbose=verbose,
+            n_gpus=n_gpus,
+            runs_dir=runs_dir,
+            model_names=model_names,
+            stacking_models=stacking_models,
+            eval_metric=eval_metric,
+        )
+
+    def _mean_members(self, pool=None) -> list[str]:
+        """Mean members of ``pool`` (default: every stacker), minus its ridge.
+
+        The pool is an argument because ``high`` builds two means from two
+        disjoint-except-``probability-nn`` halves of ``stacking_models``.
+        """
+        pool = self.stacking_models if pool is None else pool
+        return [m for m in pool if m not in self.MEAN_STACKER_EXCLUDE]
+
+    def _mean_pools(self) -> dict[str, list[str]]:
+        """Mean candidate name -> the stackers it averages, for this preset."""
+        if self.preset == "low":
+            return {}
+        pools = {self.MEAN_STACKER_NAME: _ENHANCED_V2_PLAIN_STACKERS}
+        if self.preset == "high":
+            pools[self.BALANCED_MEAN_STACKER_NAME] = _ENHANCED_V2_BALANCED_STACKERS
+        return {name: self._mean_members(pool) for name, pool in pools.items()}
+
+    def _select_best_model(self):
+        if self.preset == "low":
+            # One stacker, so there is nothing to select and no mean to build.
+            # selection is None, so this keeps best_model = stacking_models[0]
+            # from __init__ — the same head the table below resolves to.
+            LokyStackerV10Base._select_best_model(self)
+        else:
+            self._score_stack_candidates()
+        self.best_model = _ENHANCED_V2_SERVED_HEAD[(self.preset, self.eval_metric)]
+        self.log(
+            f"Serving {self.best_model} (preset={self.preset}, eval_metric={self.eval_metric})",
+            level=1,
+        )
+
+    def _score_stack_candidates(self):
+        """Append OOF Brier rows for every stacker and every competing mean.
+
+        Diagnostics only — the served head comes from the (preset, eval_metric)
+        table, not from these scores. Deliberately does not call
+        ``TSCGlueET._select_best_model``, which would fit the unused level-2
+        ExtraTrees and then serve it regardless of ``best_model``.
+        """
+        y = read_array("y", str(self._require_tmpdir()))
+        brier_scores = {name: self._oof_brier_score(y, name) for name in self.stacking_models}
+        mean_pools = self._mean_pools()
+        for mean_name, members in mean_pools.items():
+            if len(members) >= 2:
+                brier_scores[mean_name] = self._oof_mean_brier_score(y, members)
+        for name, score in brier_scores.items():
+            self._oof_scores.append(
+                {
+                    "model": name,
+                    "level": 2 if name in mean_pools else 1,
+                    "eval_metric": "brier",
+                    "oof_score": score,
+                    "train_time": None,
+                }
+            )
+            self.log(f"OOF brier (stack) {name}: {score}", level=1)
+
+    def _predict_proba(self, X):
+        mean_pools = self._mean_pools()
+        if self._fallback_path.exists() or self.best_model not in mean_pools:
+            return super()._predict_proba(X)
+        probas = self.predict_proba_per_model(X)
+        return np.mean([probas[m] for m in mean_pools[self.best_model]], axis=0)
+
+    def _fit_fallback(self, X, y, fit_start_time):
+        # Local import: tscglue.fallback imports from this module.
+        from tscglue.fallback import MRHydraET
+
+        self.log("Falling back to MRHydraET", level=1, start_time=fit_start_time)
+        fallback = MRHydraET(random_state=self.random_state, n_jobs=self.n_jobs)
+        fallback.fit(X, y)
+        save_model(fallback, "fallback", str(self._model_dir))
+        self.log("Fallback model trained successfully", level=1, start_time=fit_start_time)
+
+
 class TSCGlueLogisticClassifier(LokyStackerV10RSTSFRandom):
     STACKING_MODEL = "probability-logisticcv"
 
