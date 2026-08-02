@@ -851,6 +851,18 @@ class LokyStackerV10Base(BaseClassifier):
     def _label_to_python(self, value: Any) -> Any:
         return value.item() if isinstance(value, np.generic) else value
 
+    def _missing_classes(self, classes) -> list:
+        """Labels seen in ``y`` that a fitted model cannot predict.
+
+        Every fold model has to cover all of ``self.classes_``: the OOF matrix and
+        the per-model prediction blocks are assembled with one column per class, so
+        a model with a narrower ``classes_`` leaves NaN columns behind and cannot be
+        stacked or served. When any model comes back short the stack is abandoned in
+        favour of the fallback.
+        """
+        seen = {str(c) for c in np.asarray(classes)}
+        return [self._label_to_python(c) for c in self.classes_ if str(c) not in seen]
+
     def _probability_key(self, level: int, model_name: str, cls: Any) -> tuple[int, str, Any]:
         return int(level), model_name, self._label_to_python(cls)
 
@@ -1348,6 +1360,20 @@ class LokyStackerV10Base(BaseClassifier):
                         start_time=fit_start,
                     )
 
+                    missing = self._missing_classes(classes_)
+                    if missing:
+                        self.log(
+                            f"{model_id_result} f-{fold_number} predicts "
+                            f"{len(classes_)}/{self.n_classes_} classes (missing {missing}), "
+                            "stacking not possible",
+                            level=1,
+                            start_time=fit_start,
+                        )
+                        for pending in futures:
+                            pending.cancel()
+                        self._fit_fallback(X, y, fit_start)
+                        return
+
                     new_preds = self.add_probabilities(
                         probas=proba,
                         classes=classes_,
@@ -1463,6 +1489,20 @@ class LokyStackerV10Base(BaseClassifier):
                         level=2,
                         start_time=fit_start,
                     )
+
+                    missing = self._missing_classes(classes_)
+                    if missing:
+                        self.log(
+                            f"Stacker {model_id_result} f-{fold_number} predicts "
+                            f"{len(classes_)}/{self.n_classes_} classes (missing {missing}), "
+                            "stacking not possible",
+                            level=1,
+                            start_time=fit_start,
+                        )
+                        for pending in futures:
+                            pending.cancel()
+                        self._fit_fallback(X, y, fit_start)
+                        return
 
                     new_preds = self.add_probabilities(
                         probas=proba,
@@ -2175,6 +2215,19 @@ class TSCGlueET(TSCGlueBrierSelect):
         y = read_array("y", str(self._require_tmpdir()))
         X2, valid = self._level2_oof_matrix(y)
         y_valid = np.asarray(y[valid])
+
+        # Rows with NaN OOF probabilities are dropped above; if that drops a class
+        # entirely the level-2 head could not predict it, so serve the fallback.
+        missing = self._missing_classes(np.unique(y_valid))
+        if missing:
+            self.log(
+                f"Level-2 training rows cover {self.n_classes_ - len(missing)}/"
+                f"{self.n_classes_} classes (missing {missing}), level-2 head not trainable",
+                level=1,
+            )
+            self._fit_fallback(read_array("X", str(self._require_tmpdir())), y, None)
+            return
+
         seed = self._get_feature_seed()
         self.level2_model_ = self._make_level2_model(seed)
 
@@ -2325,7 +2378,8 @@ class TSCGlueEnhanced(TSCGlueETAll):
       (TSCGlueETAll).
 
     All presets fall back to MRHydraET when the stack cannot be built (a class
-    with fewer than two instances, or NaNs in the assembled OOF matrix).
+    with fewer than two instances, NaNs in the assembled OOF matrix, or a fitted
+    model whose ``classes_`` does not cover every class in ``y``).
     """
 
     def __init__(

@@ -197,6 +197,61 @@ def test_dual_fit_predict():
     np.testing.assert_allclose(proba.sum(axis=1), 1.0, atol=1e-6)
 
 
+def test_missing_classes_helper():
+    """_missing_classes reports labels of y that a fitted model cannot predict."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        model = LokyStackerV10Base(random_state=0, runs_dir=tmp_dir)
+
+    model.classes_ = np.array(["a", "b", "c"])
+    assert model._missing_classes(np.array(["a", "b", "c"])) == []
+    assert model._missing_classes(np.array(["a", "c"])) == ["b"]
+    assert model._missing_classes(np.array(["c"])) == ["a", "b"]
+
+    # Integer labels: comparison is on str, so dtype differences must not matter.
+    model.classes_ = np.array([0, 1, 2])
+    assert model._missing_classes(np.array([0, 1, 2], dtype=np.int32)) == []
+    assert model._missing_classes(np.array([0, 2])) == [1]
+
+
+class _PhantomClassStacker(LokyStackerV10Base):
+    """Stack whose ``classes_`` holds a label no fold model can ever be fitted on.
+
+    Stands in for a base model that comes back with a narrower ``classes_`` than
+    ``y`` — the condition the fallback guard exists for, which is otherwise hard
+    to provoke through stratified folds.
+    """
+
+    def _fit(self, X, y):
+        self.classes_ = np.append(self.classes_, "__phantom__")
+        self.n_classes_ = len(self.classes_)
+        return super()._fit(X, y)
+
+
+def test_fallback_when_model_misses_class():
+    X_train, y_train = _make_classification_data(n_per_class=6, n_classes=3, seed=0)
+    X_test, _ = _make_classification_data(n_per_class=2, n_classes=3, seed=1)
+    y_train = y_train.astype(str)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        model = _PhantomClassStacker(
+            random_state=0,
+            k_folds=2,
+            n_jobs=2,
+            model_names=["quant-etc"],
+            runs_dir=tmp_dir,
+        )
+        model.fit(X_train, y_train)
+
+        assert model._fallback_path.exists(), "Incomplete classes_ did not trigger the fallback"
+        # No stack was built, so nothing was scored or selected.
+        assert model.summary() == []
+
+        y_pred = model.predict(X_test)
+
+    assert y_pred.shape == (len(X_test),)
+    assert set(np.unique(y_pred)).issubset(set(np.unique(y_train)))
+
+
 def _make_regression_data(n_train=40, n_test=15, n_channels=1, n_timesteps=30, seed=0):
     rng = np.random.default_rng(seed)
     X_train = rng.standard_normal((n_train, n_channels, n_timesteps)).astype(np.float32)
