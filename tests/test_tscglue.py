@@ -12,7 +12,10 @@ from tscglue.models import (
     TSCAGGlueClassifier,
     TSCGlueClassifier,
     TSCGlueDual,
+    TSCGlueEnhancedV2,
+    TSCGlueEnhancedV3,
     TSCGlueRegressor,
+    get_feature_transformer,
 )
 
 
@@ -250,6 +253,82 @@ def test_fallback_when_model_misses_class():
 
     assert y_pred.shape == (len(X_test),)
     assert set(np.unique(y_pred)).issubset(set(np.unique(y_train)))
+
+
+def test_hydra_transformer_is_device_routed():
+    """A non-cpu device swaps aeon's hydra for the torch one; cpu keeps aeon's."""
+    from aeon.transformations.collection.convolution_based._hydra import HydraTransformer
+
+    from tscglue.features_gpu import HydraTransformerDevice
+
+    assert isinstance(get_feature_transformer("hydra", seed=0), HydraTransformer)
+    assert isinstance(get_feature_transformer("hydra", seed=0, device="cpu"), HydraTransformer)
+
+    gpu = get_feature_transformer("hydra", seed=0, device="cuda")
+    assert isinstance(gpu, HydraTransformerDevice)
+    assert gpu.device == "cuda"
+    assert gpu.random_state == 0
+
+
+def _lane_names(model):
+    gpu_features, cpu_features = model._split_feature_lanes()
+    return [ft.feature_name for ft in gpu_features], [ft.feature_name for ft in cpu_features]
+
+
+def test_enhanced_v3_puts_hydra_on_the_gpu_first():
+    """V3 moves hydra into the device lane, ahead of the foundation models."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        v3 = TSCGlueEnhancedV3(random_state=0, n_gpus=1, preset="high", runs_dir=tmp_dir)
+        v2 = TSCGlueEnhancedV2(random_state=0, n_gpus=1, preset="high", runs_dir=tmp_dir)
+
+        v3_gpu, v3_cpu = _lane_names(v3)
+        v2_gpu, v2_cpu = _lane_names(v2)
+
+        assert v3_gpu == ["hydra", "mantis", "chronos2"]
+        assert "hydra" not in v3_cpu
+        assert v3._feature_device("hydra") == "cuda"
+
+        # V2 is untouched: hydra stays on the cpu lane and is built for the cpu.
+        assert v2_gpu == ["mantis", "chronos2"]
+        assert "hydra" in v2_cpu
+        assert v2._feature_device("hydra") == "cpu"
+
+        # Only hydra moves -- every other feature is still built for the cpu.
+        assert v3._feature_device("quant") == "cpu"
+        assert v3._feature_device("multirocket") == "cpu"
+        assert v3._feature_device("mantis") == "cuda"
+
+
+def test_enhanced_v3_without_gpu_matches_v2():
+    """n_gpus=0 makes V3 exactly V2: no device lane, hydra built for the cpu."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        v3 = TSCGlueEnhancedV3(random_state=0, n_gpus=0, preset="high", runs_dir=tmp_dir)
+        v2 = TSCGlueEnhancedV2(random_state=0, n_gpus=0, preset="high", runs_dir=tmp_dir)
+
+        assert _lane_names(v3) == _lane_names(v2)
+        assert _lane_names(v3)[0] == []
+        assert v3._feature_device("hydra") == "cpu"
+        assert v3._feature_device("mantis") == "cpu"
+
+
+def test_hydra_device_falls_back_to_cpu_without_cuda():
+    """A cuda-fitted transformer stays usable where there is no cuda to unpickle onto."""
+    torch = pytest.importorskip("torch")
+    if torch.cuda.is_available():
+        pytest.skip("guard only fires when CUDA is absent")
+
+    from tscglue.features_gpu import HydraTransformerDevice
+
+    X, _ = _make_classification_data(n_per_class=3, n_classes=2, n_timesteps=64)
+
+    transformer = HydraTransformerDevice(random_state=0, device="cuda").fit(X)
+    with pytest.warns(RuntimeWarning, match="no CUDA device"):
+        Xt = transformer.transform(X)
+
+    # Kernels are drawn on the cpu, so falling back must reproduce the cpu run exactly.
+    expected = HydraTransformerDevice(random_state=0, device="cpu").fit_transform(X)
+    np.testing.assert_array_equal(Xt, expected)
+    assert transformer.device == "cuda", "device is a constructor param and must not be mutated"
 
 
 def _make_regression_data(n_train=40, n_test=15, n_channels=1, n_timesteps=30, seed=0):

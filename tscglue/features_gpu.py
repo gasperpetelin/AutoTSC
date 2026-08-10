@@ -1,7 +1,11 @@
 """Device-aware feature transformers.
 
-Standalone: nothing here is wired into ``tscglue.models`` yet.
+``get_feature_transformer("hydra", device=...)`` returns ``HydraTransformerDevice``
+instead of aeon's transformer whenever a non-cpu device is asked for, which is what
+``TSCGlueEnhancedV3`` uses to move hydra onto the GPU.
 """
+
+import warnings
 
 import numpy as np
 from aeon.transformations.collection import BaseCollectionTransformer
@@ -184,9 +188,29 @@ class HydraTransformerDevice(BaseCollectionTransformer):
 
         return torch.cat(Z, 1).view(n_cases, -1)
 
+    def _resolve_device(self):
+        """``self.device``, degraded to cpu when cuda is asked for but unavailable.
+
+        A fitted transformer is pickled with its device and reloaded at predict time
+        without one, so a model fitted on a GPU box would otherwise be unusable on a
+        cpu-only one. ``self.device`` itself is left alone -- it is a constructor
+        parameter, and sklearn clone semantics say it stays as passed.
+        """
+        torch = _require_torch()
+        device = torch.device(self.device)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            warnings.warn(
+                f"device={self.device!r} was requested but no CUDA device is available; "
+                "running on cpu instead.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            return torch.device("cpu")
+        return device
+
     def _transform(self, X, y=None):
         torch = _require_torch()
-        device, dtype = torch.device(self.device), getattr(torch, self.dtype)
+        device, dtype = self._resolve_device(), getattr(torch, self.dtype)
 
         W = self.W_.to(device=device, dtype=dtype)
         idx = [i.to(device) for i in self.idx_]

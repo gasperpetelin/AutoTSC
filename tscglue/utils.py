@@ -9,8 +9,40 @@ from threadpoolctl import threadpool_limits
 
 
 class RidgeClassifierCVDecisionProba(RidgeClassifierCV):
+    """RidgeClassifierCV with softmax probabilities and a thread budget.
+
+    ``n_jobs`` is a BLAS thread count, not process parallelism: sklearn's
+    RidgeClassifierCV has no ``n_jobs`` of its own, and with ``cv=None`` it takes the
+    leave-one-out GCV path, which is pure BLAS -- so the thread pool is the only lever.
+    ``-1`` lifts the limit entirely.
+
+    The default of 1 is what the stack fits with, since the outer loop already
+    parallelises over folds and models and a wide inner ridge would oversubscribe.
+    """
+
+    def __init__(
+        self,
+        alphas=(0.1, 1.0, 10.0),
+        *,
+        fit_intercept=True,
+        scoring=None,
+        cv=None,
+        class_weight=None,
+        store_cv_results=False,
+        n_jobs=1,
+    ):
+        super().__init__(
+            alphas=alphas,
+            fit_intercept=fit_intercept,
+            scoring=scoring,
+            cv=cv,
+            class_weight=class_weight,
+            store_cv_results=store_cv_results,
+        )
+        self.n_jobs = n_jobs
+
     def fit(self, X, y):
-        with threadpool_limits(limits=1):
+        with threadpool_limits(limits=None if self.n_jobs == -1 else self.n_jobs):
             return super().fit(X, y)
 
     def predict_proba(self, X):

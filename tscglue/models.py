@@ -64,7 +64,6 @@ class RareClassSafeLogisticCV(BaseEstimator, ClassifierMixin):
                 C=self.fixed_C,
                 solver=self.solver,
                 max_iter=self.max_iter,
-                multi_class="multinomial",
                 class_weight=self.class_weight,
             )
         else:
@@ -73,7 +72,6 @@ class RareClassSafeLogisticCV(BaseEstimator, ClassifierMixin):
                 Cs=self.Cs,
                 solver=self.solver,
                 max_iter=self.max_iter,
-                multi_class="multinomial",
                 class_weight=self.class_weight,
             )
         self.estimator_.fit(X, y)
@@ -132,21 +130,39 @@ class AutoSelectKBestClassifier(BaseEstimator, ClassifierMixin):
         else:
             clf = clone(self.classifier)
 
-        self.classifier_ = Pipeline(
-            [
-                ("var", VarianceThreshold()),
-                ("select", SelectKBest(score_func=self.score_func, k=k)),
-                ("clf", clf),
-            ]
-        )
+        var = VarianceThreshold()
+        select = SelectKBest(score_func=self.score_func, k=k)
+
         # Suppress f_classif "Features are constant" warnings: after CV fold splitting
         # and scaling, some features have near-zero variance that passes VarianceThreshold
         # but f_classif still treats as constant. These features are harmless (never selected).
         import warnings
 
+        # Steps are fitted one at a time rather than through Pipeline.fit purely so each
+        # can be timed; the order and the inputs are what Pipeline.fit would do. The
+        # already-fitted steps are then assembled into the Pipeline predict/predict_proba
+        # use, so nothing downstream changes.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            self.classifier_.fit(X, y)
+            t0 = perf_counter()
+            Xt = var.fit_transform(X)
+            t_var = perf_counter() - t0
+
+            t0 = perf_counter()
+            Xt = select.fit_transform(Xt, y)
+            t_select = perf_counter() - t0
+
+            t0 = perf_counter()
+            clf.fit(Xt, y)
+            t_clf = perf_counter() - t0
+
+        self.classifier_ = Pipeline([("var", var), ("select", select), ("clf", clf)])
+        self.fit_times_ = {
+            "variance_s": t_var,
+            "select_s": t_select,
+            "clf_s": t_clf,
+            "total_s": t_var + t_select + t_clf,
+        }
 
         # sklearn convention: expose classes_
         inner = self.classifier_.named_steps["clf"]
@@ -431,6 +447,13 @@ def get_feature_transformer(feature_type: str, seed: int, n_jobs: int = 1, devic
         case "quant":
             return QUANTTransformer()
         case "hydra":
+            if device != "cpu":
+                # Local import, as for the foundation models below: torch is only a
+                # hard dependency on the device path. HydraTransformerDevice takes no
+                # n_jobs -- the device path has no CPU work worth budgeting.
+                from tscglue.features_gpu import HydraTransformerDevice
+
+                return HydraTransformerDevice(random_state=seed, device=device)
             return HydraTransformer(n_jobs=n_jobs, random_state=seed)
         case "mantis":
             from tscglue.models_tsfm import MantisEmbedding
@@ -664,6 +687,10 @@ class LokyStackerV10Base(BaseClassifier):
     ]
     SERIES_MODELS = ["rstsf"]
     STACKING_MODEL = "probability-ridgecv"
+    # Features computed on the GPU when one is available. Membership decides both which
+    # features are queued in the background device lane and which are built with
+    # ``self._device``; the order is the order the lane runs them in.
+    GPU_FEATURE_NAMES: tuple[str, ...] = ("mantis", "chronos2")
     NO_SUBPROCESS_FEATURES: set[str] = {"multirocket", "rdst"}
     NO_SUBPROCESS_FEATURES: set[str] = {"multirocket", "rdst"}
 
@@ -830,6 +857,33 @@ class LokyStackerV10Base(BaseClassifier):
     @property
     def _device(self) -> str:
         return "cuda" if self.n_gpus != 0 else "cpu"
+
+    def _feature_device(self, feature_name: str) -> str:
+        """Device a feature transformer is built for.
+
+        Only ``GPU_FEATURE_NAMES`` opt in; everything else is built for the cpu
+        regardless of ``n_gpus``, which is what keeps a subclass adding one name to
+        that tuple from changing any other feature.
+        """
+        return self._device if feature_name in self.GPU_FEATURE_NAMES else "cpu"
+
+    def _split_feature_lanes(self) -> tuple[list[FeatureSpec], list[FeatureSpec]]:
+        """Feature specs split into (device lane, cpu lane).
+
+        The device lane runs sequentially in one background thread, so it is ordered by
+        ``GPU_FEATURE_NAMES``: a cheap transform placed first releases its device memory
+        before the foundation models allocate. Without a GPU the device lane is empty
+        and everything runs on the main thread, as it did before there was a lane.
+        """
+        use_gpu = self._device != "cpu"
+
+        def on_device(ft) -> bool:
+            return use_gpu and ft.feature_name in self.GPU_FEATURE_NAMES
+
+        features = [ft for ft in self.features_list if ft.feature_name != "raw"]
+        gpu_features = [ft for ft in features if on_device(ft)]
+        gpu_features.sort(key=lambda ft: self.GPU_FEATURE_NAMES.index(ft.feature_name))
+        return gpu_features, [ft for ft in features if not on_device(ft)]
 
     def _get_feature_seed(self) -> int:
         return int(self.feature_seed.integers(0, 2**31 - 1, dtype=np.int32))
@@ -1041,18 +1095,16 @@ class LokyStackerV10Base(BaseClassifier):
         directory = str(self._tmpdir)
         X_path = str(self._tmpdir / "X.npy")
 
-        _GPU_FEATURE_NAMES = {"mantis", "chronos2"}
-        use_gpu = self._device != "cpu"
-        gpu_features = [ft for ft in self.features_list if ft.feature_name != "raw" and ft.feature_name in _GPU_FEATURE_NAMES and use_gpu]
-        cpu_features = [ft for ft in self.features_list if ft.feature_name != "raw" and (ft.feature_name not in _GPU_FEATURE_NAMES or not use_gpu)]
+        gpu_features, cpu_features = self._split_feature_lanes()
         gpu_error: list[BaseException] = []
 
         def _log_feature(ft, t0):
             Xt = read_array(f"Xt_{ft.get_feature_id()}", directory)
             size_mb = Xt.nbytes / (1024 * 1024)
             elapsed = perf_counter() - t0
+            device = self._feature_device(ft.feature_name)
             self.log(
-                f"Fit+transformed {ft.get_feature_id()} features {Xt.shape} ({size_mb:.2f} MB) dtype={Xt.dtype} in {elapsed:.4f}s",
+                f"Fit+transformed {ft.get_feature_id()} [{device}] features {Xt.shape} ({size_mb:.2f} MB) dtype={Xt.dtype} in {elapsed:.4f}s",
                 level=1,
                 start_time=fit_start_time,
             )
@@ -1081,7 +1133,7 @@ class LokyStackerV10Base(BaseClassifier):
                             ft.get_feature_id(),
                             self.feature_dtype,
                             self.verbose,
-                            self._device,
+                            self._feature_device(ft.feature_name),
                         ),
                     )
                     _log_feature(ft, t0)
@@ -1106,7 +1158,7 @@ class LokyStackerV10Base(BaseClassifier):
                         ft.get_feature_id(),
                         self.feature_dtype,
                         self.verbose,
-                        self._device,
+                        self._feature_device(ft.feature_name),
                     ),
                 )
             else:
@@ -1119,7 +1171,7 @@ class LokyStackerV10Base(BaseClassifier):
                     directory,
                     ft.get_feature_id(),
                     self.feature_dtype,
-                    self._device,
+                    self._feature_device(ft.feature_name),
                 )
             _log_feature(ft, t0)
 
@@ -1131,17 +1183,15 @@ class LokyStackerV10Base(BaseClassifier):
         compute_start = perf_counter()
         X_path = f"{directory}/X.npy"
 
-        _GPU_FEATURE_NAMES = {"mantis", "chronos2"}
-        use_gpu = self._device != "cpu"
-        gpu_features = [ft for ft in self.features_list if ft.feature_name != "raw" and ft.feature_name in _GPU_FEATURE_NAMES and use_gpu]
-        cpu_features = [ft for ft in self.features_list if ft.feature_name != "raw" and (ft.feature_name not in _GPU_FEATURE_NAMES or not use_gpu)]
+        gpu_features, cpu_features = self._split_feature_lanes()
         gpu_error: list[BaseException] = []
 
         def _log_feature(ft, t0):
             Xt = read_array(f"Xt_{ft.get_feature_id()}", directory)
             size_mb = Xt.nbytes / (1024 * 1024)
+            device = self._feature_device(ft.feature_name)
             self.log(
-                f"Computed {ft.get_feature_id()} features {Xt.shape} ({size_mb:.2f} MB) dtype={Xt.dtype} in {perf_counter() - t0:.4f}s",
+                f"Computed {ft.get_feature_id()} [{device}] features {Xt.shape} ({size_mb:.2f} MB) dtype={Xt.dtype} in {perf_counter() - t0:.4f}s",
                 level=1,
                 start_time=compute_start if start_time is None else start_time,
             )
@@ -2646,6 +2696,38 @@ class TSCGlueEnhancedV2(TSCGlueETAll):
         self.log("Fallback model trained successfully", level=1, start_time=fit_start_time)
 
 
+class TSCGlueEnhancedV3(TSCGlueEnhancedV2):
+    """TSCGlueEnhancedV2 with hydra computed on the GPU.
+
+    The only difference from V2. Presets, stacker pools, served-head table, Brier
+    diagnostics and the MRHydraET fallback are all inherited untouched, so the two are
+    directly comparable.
+
+    Adding ``hydra`` to ``GPU_FEATURE_NAMES`` does two things at once: hydra is built
+    with ``self._device`` (so ``get_feature_transformer`` returns
+    :class:`~tscglue.features_gpu.HydraTransformerDevice` rather than aeon's
+    ``HydraTransformer``), and it is queued in the background device lane instead of
+    the main-thread cpu lane. It is listed *first*, so on the presets that also use the
+    foundation models it runs and releases its device memory before they allocate --
+    and its cost comes off the cpu lane, which is the critical path there (weasel and
+    rdst dominate it).
+
+    Two consequences worth knowing:
+
+    * **With ``n_gpus=0`` this is exactly V2.** ``_feature_device`` returns ``"cpu"``,
+      so hydra is aeon's transformer in the cpu lane, as before.
+    * **With a GPU it is not bit-identical to V2.** The kernels are the same -- they are
+      drawn on the cpu from the same ``random_state`` -- but the arithmetic runs in
+      float32 on the device. Deviation is ~1e-6 relative for the features themselves,
+      except that hydra picks a winning kernel with ``max`` and scatter-adds into its
+      bucket, so two kernels within float32 epsilon can swap and move a whole count.
+      Compare accuracy distributions against V2, never exact outputs
+      (``notebooks/hydra_cpu_vs_gpu.ipynb`` measures both effects).
+    """
+
+    GPU_FEATURE_NAMES = ("hydra", "mantis", "chronos2")
+
+
 class TSCGlueLogisticClassifier(LokyStackerV10RSTSFRandom):
     STACKING_MODEL = "probability-logisticcv"
 
@@ -3512,6 +3594,13 @@ class SparseScaler:
         return self._apply(Xt)
 
 
+def select_rows(arr, idx):
+    """Rows of `arr` picked out by `idx`, or `arr` itself when `idx` is None."""
+    if idx is None:
+        return arr
+    return arr[idx]
+
+
 class DictMultiScaler(BaseEstimator, TransformerMixin):
     """
     Like MultiScaler but receives a dict of numpy arrays keyed by feature group name.
@@ -3538,13 +3627,12 @@ class DictMultiScaler(BaseEstimator, TransformerMixin):
         return self
 
     def transform(self, X: dict[str, np.ndarray], idx=None):
-        select = (lambda arr: arr[idx]) if idx is not None else (lambda arr: arr)
         keys = [key for key in self.scalers_ if key in X]
         if not keys:
             return np.empty((next(iter(X.values())).shape[0], 0))
 
         widths = [X[key].shape[1] for key in keys]
-        n_samples = select(X[keys[0]]).shape[0]
+        n_samples = X[keys[0]].shape[0] if idx is None else len(idx)
         dtype = np.result_type(*(X[key].dtype for key in keys))
 
         # Pre-allocate the full output once; fill it column-by-column so at most
@@ -3553,7 +3641,7 @@ class DictMultiScaler(BaseEstimator, TransformerMixin):
         out = np.empty((n_samples, sum(widths)), dtype=dtype)
         col = 0
         for key, width in zip(keys, widths):
-            scaled = self.scalers_[key].transform(select(X[key]))
+            scaled = self.scalers_[key].transform(select_rows(X[key], idx))
             out[:, col:col + width] = scaled
             del scaled
             col += width

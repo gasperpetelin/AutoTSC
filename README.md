@@ -128,14 +128,19 @@ member — when it fires it is the *only* thing served, for every prediction.
 
 ### Triggers
 
-Two, both hard failures of the cross-validation the stack is built on:
+Three, all hard failures of the cross-validation the stack is built on:
 
 1. **Any class with fewer than 2 instances** — no stratified fold split is possible, so no OOF
    probabilities exist to stack.
 2. **NaNs in the assembled OOF probability matrix** — a base model failed to produce
    predictions for some rows, so the level-1 input is incomplete.
+3. **Any fitted model missing a class** — every fold model (level 0, level 1) and the level-2
+   head must have a `classes_` covering all of `y`. A model fitted on a subset predicts a
+   narrower probability block than the one column per class the OOF matrix and the served
+   output are assembled from, so the stack is abandoned as soon as one short model appears;
+   the remaining folds are cancelled.
 
-Both are decided during `fit`. Once a fallback is persisted, `predict` / `predict_proba` route
+All are decided during `fit`. Once a fallback is persisted, `predict` / `predict_proba` route
 to it unconditionally and no level-1 or level-2 code runs.
 
 ### Why `MRHydraET`
