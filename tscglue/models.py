@@ -588,6 +588,7 @@ class FeatureSpec:
     feature_name: str
     feature_seed: int | None = None
     use_subprocess: bool = True
+    support_gpu: bool = False
 
     def get_feature_id(self):
         return (
@@ -731,12 +732,18 @@ class LokyStackerV10Base(BaseClassifier):
     def _make_feature_spec(self, feature_name: str, group_rng: np.random.Generator) -> FeatureSpec:
         """Create a single FeatureSpec. Seedless for deterministic transforms like quant."""
         use_subprocess = feature_name not in self.NO_SUBPROCESS_FEATURES
+        support_gpu = feature_name in ("hydra", "mantis", "chronos2")
         if feature_name in ("quant", "raw", "mantis", "chronos2", "tsfresh"):
-            return FeatureSpec(feature_name=feature_name, use_subprocess=use_subprocess)
+            return FeatureSpec(
+                feature_name=feature_name,
+                use_subprocess=use_subprocess,
+                support_gpu=support_gpu,
+            )
         return FeatureSpec(
             feature_name=feature_name,
             feature_seed=int(group_rng.integers(0, 2**31 - 1)),
             use_subprocess=use_subprocess,
+            support_gpu=support_gpu,
         )
 
     def build_model_specs(self, model_names: list[str]) -> list[ModelSpec]:
@@ -2504,12 +2511,18 @@ class TSCGlueRegressor(BaseRegressor):
 
     def _make_feature_spec(self, feature_name: str, group_rng: np.random.Generator) -> FeatureSpec:
         use_subprocess = feature_name not in self.NO_SUBPROCESS_FEATURES
+        support_gpu = feature_name in ("hydra", "mantis", "chronos2")
         if feature_name in ("quant", "mantis", "chronos2", "tsfresh"):
-            return FeatureSpec(feature_name=feature_name, use_subprocess=use_subprocess)
+            return FeatureSpec(
+                feature_name=feature_name,
+                use_subprocess=use_subprocess,
+                support_gpu=support_gpu,
+            )
         return FeatureSpec(
             feature_name=feature_name,
             feature_seed=int(group_rng.integers(0, 2**31 - 1)),
             use_subprocess=use_subprocess,
+            support_gpu=support_gpu,
         )
 
     def _build_model_specs(self, model_names: list[str]) -> list[ModelSpec]:
