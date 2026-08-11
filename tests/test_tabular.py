@@ -6,11 +6,14 @@ from sklearn.linear_model import RidgeCV
 from tscglue.tabular import (
     AutoSelectKBestClassifier,
     ClippedRegressor,
+    NoScaler,
     RidgeClassifierCVDecisionProba,
     RidgeClassifierCVIndicator,
+    SparseScaler,
 )
 
 HEADS = [RidgeClassifierCVDecisionProba, RidgeClassifierCVIndicator, AutoSelectKBestClassifier]
+SCALERS = [SparseScaler, NoScaler]
 
 
 def _make_data(n_classes=2, n_per_class=25, n_features=12, seed=0, str_labels=False):
@@ -31,6 +34,14 @@ def _make_regression_data(n_samples=60, n_features=8, seed=0):
     X = rng.standard_normal((n_samples, n_features))
     y = X @ rng.standard_normal(n_features) + 0.1 * rng.standard_normal(n_samples)
     return X, y
+
+
+def _make_counts_data(n_samples=40, n_features=10, seed=0):
+    """Sparse non-negative counts, the shape of feature block SparseScaler is built for."""
+    rng = np.random.default_rng(seed)
+    X = rng.integers(0, 6, size=(n_samples, n_features)).astype(np.float32)
+    X[rng.random(X.shape) < 0.5] = 0.0
+    return X
 
 
 @pytest.mark.parametrize("head", HEADS)
@@ -99,9 +110,37 @@ def test_clone_preserves_clipped_regressor_params():
 
     cloned = clone(reg)
 
-    # No get_params() equality here: clone deep-copies the wrapped estimator and
-    # sklearn estimators compare by identity, so the dicts never match.
     assert isinstance(cloned.regressor, RidgeCV)
     assert cloned.regressor.alphas == (0.5, 5.0)
     assert cloned.regressor is not reg.regressor
+
+
+@pytest.mark.parametrize("scaler", SCALERS)
+def test_scaler_transform_keeps_shape_and_stays_finite(scaler):
+    X = _make_counts_data()
+
+    Xt = scaler().fit(X).transform(X)
+
+    assert Xt.shape == X.shape
+    assert np.isfinite(Xt).all()
+
+
+@pytest.mark.parametrize("scaler", SCALERS)
+def test_scaler_does_not_mutate_its_input(scaler):
+    X = _make_counts_data()
+    original = X.copy()
+
+    scaler().fit_transform(X)
+
+    np.testing.assert_array_equal(X, original)
+
+
+@pytest.mark.parametrize("scaler", SCALERS)
+def test_scaler_fit_transform_matches_fit_then_transform(scaler):
+    X = _make_counts_data()
+
+    one_pass = scaler().fit_transform(X)
+    two_pass = scaler().fit(X).transform(X)
+
+    np.testing.assert_allclose(one_pass, two_pass)
 

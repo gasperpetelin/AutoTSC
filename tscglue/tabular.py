@@ -5,7 +5,7 @@
 from time import perf_counter
 
 import numpy as np
-from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin, clone
+from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin, TransformerMixin, clone
 from sklearn.feature_selection import SelectKBest, VarianceThreshold, f_classif
 from sklearn.linear_model import RidgeClassifierCV
 from sklearn.pipeline import Pipeline
@@ -212,3 +212,47 @@ class ClippedRegressor(BaseEstimator, RegressorMixin):
 
     def predict(self, X):
         return np.clip(self.regressor_.predict(X), self.y_min_, self.y_max_)
+
+
+class SparseScaler:
+    """Sparse Scaler for hydra transform (NumPy version)."""
+
+    def __init__(self, mask=True, exponent=4):
+        self.mask = mask
+        self.exponent = exponent
+
+    def _run(self, X, fit, scale):
+        Xt = np.clip(X, 0, None)
+        np.sqrt(Xt, out=Xt)
+
+        if fit:
+            epsilon = (Xt == 0).mean(axis=0) ** self.exponent + 1e-8
+            self.mu = Xt.mean(axis=0)
+            self.sigma = (Xt.std(axis=0) + epsilon).astype(Xt.dtype)
+        if not scale:
+            return None
+
+        mask = (Xt != 0) if self.mask else None  # must precede the subtraction
+        Xt -= self.mu
+        if mask is not None:
+            Xt *= mask
+        Xt /= self.sigma
+        return Xt
+
+    def fit(self, X, y=None):
+        self._run(X, fit=True, scale=False)
+        return self
+
+    def transform(self, X, y=None):
+        return self._run(X, fit=False, scale=True)
+
+    def fit_transform(self, X, y=None):
+        return self._run(X, fit=True, scale=True)
+
+
+class NoScaler(BaseEstimator, TransformerMixin):
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        return X

@@ -17,12 +17,8 @@ from aeon.classification.base import BaseClassifier
 from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.preprocessing import StandardScaler
 
-from tscglue.models import (
-    RareClassSafeLogisticCV,
-    SparseScaler,
-    get_feature_transformer,
-)
-from tscglue.tabular import AutoSelectKBestClassifier
+from tscglue.models import RareClassSafeLogisticCV, get_feature_transformer
+from tscglue.tabular import AutoSelectKBestClassifier, SparseScaler
 
 
 class TSCFeatureBaseline(BaseClassifier):
