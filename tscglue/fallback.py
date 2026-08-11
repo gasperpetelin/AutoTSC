@@ -1,20 +1,15 @@
-"""Standalone feature-pipeline baselines built from TSCGlue's representations.
+"""Standalone feature-pipeline baseline built from TSCGlue's representations.
 
-Each model is a plain aeon classifier: extract features with one or more of the
-transformers TSCGlue already uses, concatenate the blocks, and fit a single
-sklearn head. No fold training, no stacking — these serve as independent
-per-metric baselines and as strong probabilistic fallback candidates.
+A plain aeon classifier: extract features with one or more of the transformers
+TSCGlue already uses, concatenate the blocks, and fit a single sklearn head. No
+fold training, no stacking.
 
-Concrete models (bake-off precedents from "Bake off redux", Table 14):
+- ``MRHydraET``  multirocket + hydra -> ExtraTrees  rocket features, forest probabilities
 
-- ``QuantET``          quant -> ExtraTrees                        ~ QUANT (NLL 0.497, AUROC 0.962)
-- ``MultiET``          quant + rstsf-random + rdst -> ExtraTrees  ~ RIST (AUROC 0.966)
-- ``MRHydraET``        multirocket + hydra -> ExtraTrees          rocket features, forest probabilities
-- ``ShapeDictET``      rdst + weasel -> ExtraTrees                shapelet + dictionary domains
-- ``AllFeaturesET``    all six representations -> ExtraTrees      kitchen-sink forest
-- ``MRHydraLogistic``  multirocket + hydra -> LogisticCV          MR-Hydra accuracy, real probabilities
-- ``MRHydraRidge``     multirocket + hydra -> bestk ridge         ~ MR-Hydra (ACC 0.884)
-- ``AllFeaturesRidge`` multirocket + hydra + rdst + weasel -> bestk ridge  top accuracy features combined
+It is the probabilistic fallback the stacked classifiers in ``models.py`` fit
+alongside the main pipeline. ``TSCFeatureBaseline`` stays generic over feature
+sets and heads (``et``, ``logistic``, ``ridge``) so further baselines can be
+added as thin subclasses.
 """
 
 import numpy as np
@@ -144,29 +139,6 @@ class TSCFeatureBaseline(BaseClassifier):
         return self.classes_[np.argmax(self._predict_proba(X), axis=1)]
 
 
-# ----------------- forest-head models (log_loss / roc_auc) -----------------
-
-
-class QuantET(TSCFeatureBaseline):
-    """quant -> ExtraTrees. In-house QUANT twin: 2nd-best NLL and AUROC in the bake-off."""
-
-    def __init__(self, n_estimators=500, random_state=None, n_jobs=1, verbose=0):
-        super().__init__(
-            features=("quant",), head="et", n_estimators=n_estimators,
-            random_state=random_state, n_jobs=n_jobs, verbose=verbose,
-        )
-
-
-class MultiET(TSCFeatureBaseline):
-    """quant + rstsf-random + rdst -> ExtraTrees. RIST-style multi-domain forest (AUROC 0.966 precedent)."""
-
-    def __init__(self, n_estimators=500, random_state=None, n_jobs=1, verbose=0):
-        super().__init__(
-            features=("quant", "rstsf-random", "rdst"), head="et", n_estimators=n_estimators,
-            random_state=random_state, n_jobs=n_jobs, verbose=verbose,
-        )
-
-
 class MRHydraET(TSCFeatureBaseline):
     """multirocket + hydra -> ExtraTrees. Rocket features with forest probabilities instead of ridge."""
 
@@ -175,72 +147,3 @@ class MRHydraET(TSCFeatureBaseline):
             features=("multirocket", "hydra"), head="et", n_estimators=n_estimators,
             random_state=random_state, n_jobs=n_jobs, verbose=verbose,
         )
-
-
-class ShapeDictET(TSCFeatureBaseline):
-    """rdst + weasel -> ExtraTrees. Shapelet + dictionary domains under one forest."""
-
-    def __init__(self, n_estimators=500, random_state=None, n_jobs=1, verbose=0):
-        super().__init__(
-            features=("rdst", "weasel"), head="et", n_estimators=n_estimators,
-            random_state=random_state, n_jobs=n_jobs, verbose=verbose,
-        )
-
-
-class AllFeaturesET(TSCFeatureBaseline):
-    """All six CPU representations -> one ExtraTrees. Kitchen-sink maximum-diversity forest."""
-
-    def __init__(self, n_estimators=500, random_state=None, n_jobs=1, verbose=0):
-        super().__init__(
-            features=("multirocket", "hydra", "quant", "rstsf-random", "rdst", "weasel"),
-            head="et", n_estimators=n_estimators,
-            random_state=random_state, n_jobs=n_jobs, verbose=verbose,
-        )
-
-
-# ----------------- linear-head models (accuracy) -----------------
-
-
-class MRHydraLogistic(TSCFeatureBaseline):
-    """multirocket + hydra -> LogisticCV. MR-Hydra-level features with calibrated probabilities."""
-
-    def __init__(self, random_state=None, n_jobs=1, verbose=0):
-        super().__init__(
-            features=("multirocket", "hydra"), head="logistic",
-            random_state=random_state, n_jobs=n_jobs, verbose=verbose,
-        )
-
-
-class MRHydraRidge(TSCFeatureBaseline):
-    """multirocket + hydra -> bestk ridge. In-house MR-Hydra twin (accuracy anchor)."""
-
-    def __init__(self, random_state=None, n_jobs=1, verbose=0):
-        super().__init__(
-            features=("multirocket", "hydra"), head="ridge",
-            random_state=random_state, n_jobs=n_jobs, verbose=verbose,
-        )
-
-
-class AllFeaturesRidge(TSCFeatureBaseline):
-    """multirocket + hydra + rdst + weasel -> bestk ridge. Union of the bake-off's top accuracy features."""
-
-    def __init__(self, random_state=None, n_jobs=1, verbose=0):
-        super().__init__(
-            features=("multirocket", "hydra", "rdst", "weasel"), head="ridge",
-            random_state=random_state, n_jobs=n_jobs, verbose=verbose,
-        )
-
-
-BASELINES = {
-    cls.__name__: cls
-    for cls in (
-        QuantET,
-        MultiET,
-        MRHydraET,
-        ShapeDictET,
-        AllFeaturesET,
-        MRHydraLogistic,
-        MRHydraRidge,
-        AllFeaturesRidge,
-    )
-}
