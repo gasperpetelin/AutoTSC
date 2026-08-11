@@ -26,14 +26,15 @@ from aeon.transformations.collection.shapelet_based import RandomDilatedShapelet
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin, TransformerMixin, clone
 from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor, RandomForestClassifier
 from sklearn.feature_selection import SelectKBest, VarianceThreshold, chi2, f_classif
-from sklearn.linear_model import RidgeClassifierCV, RidgeCV
+from sklearn.linear_model import RidgeCV
 from sklearn.metrics import accuracy_score, r2_score
+from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from threadpoolctl import threadpool_limits
 
 from tscglue import utils
-from tscglue.utils import RidgeClassifierCVDecisionProba
+from tscglue.tabular import RidgeClassifierCVDecisionProba, RidgeClassifierCVIndicator
 
 
 class RareClassSafeLogisticCV(BaseEstimator, ClassifierMixin):
@@ -95,6 +96,7 @@ class AutoSelectKBestClassifier(BaseEstimator, ClassifierMixin):
         midpoint=300,
         steepness=0.010,
         score_func=f_classif,
+        variance_filter=True,
     ):
         self.classifier = classifier
         self.k = k
@@ -103,6 +105,7 @@ class AutoSelectKBestClassifier(BaseEstimator, ClassifierMixin):
         self.midpoint = midpoint
         self.steepness = steepness
         self.score_func = score_func
+        self.variance_filter = variance_filter
 
     def _optimal_k(self, n_train: int) -> int:
         return int(
@@ -130,7 +133,7 @@ class AutoSelectKBestClassifier(BaseEstimator, ClassifierMixin):
         else:
             clf = clone(self.classifier)
 
-        var = VarianceThreshold()
+        var = VarianceThreshold() if self.variance_filter else None
         select = SelectKBest(score_func=self.score_func, k=k)
 
         # Suppress f_classif "Features are constant" warnings: after CV fold splitting
@@ -145,7 +148,7 @@ class AutoSelectKBestClassifier(BaseEstimator, ClassifierMixin):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             t0 = perf_counter()
-            Xt = var.fit_transform(X)
+            Xt = var.fit_transform(X) if var is not None else X
             t_var = perf_counter() - t0
 
             t0 = perf_counter()
@@ -156,7 +159,8 @@ class AutoSelectKBestClassifier(BaseEstimator, ClassifierMixin):
             clf.fit(Xt, y)
             t_clf = perf_counter() - t0
 
-        self.classifier_ = Pipeline([("var", var), ("select", select), ("clf", clf)])
+        steps = [("var", var)] if var is not None else []
+        self.classifier_ = Pipeline([*steps, ("select", select), ("clf", clf)])
         self.fit_times_ = {
             "variance_s": t_var,
             "select_s": t_select,
@@ -181,6 +185,42 @@ class AutoSelectKBestClassifier(BaseEstimator, ClassifierMixin):
         return self.classifier_.predict_proba(X)
 
 
+class ThreadBudgetMLPClassifier(MLPClassifier):
+    """MLPClassifier with a BLAS thread budget, mirroring RidgeClassifierCVDecisionProba.
+
+    MLPClassifier has no thread control of its own, so its hidden-layer GEMMs default to
+    every core -- inside each of the ``n_jobs`` concurrent worker processes, in both fit
+    and predict. Measured on a 32-core box at this head's input shape, unbounded fit is
+    *slower* in wall clock than a single thread (1.61s vs 1.05s) while burning 15x the
+    CPU (51s vs 3.4s), so the bound costs nothing even when nothing else is running.
+
+    The default of 1 matches every other head in ``get_model_v6``; ``-1`` lifts the limit.
+    """
+
+    def __init__(
+        self,
+        hidden_layer_sizes=(100,),
+        *,
+        max_iter=200,
+        random_state=None,
+        n_jobs=1,
+    ):
+        super().__init__(
+            hidden_layer_sizes=hidden_layer_sizes,
+            max_iter=max_iter,
+            random_state=random_state,
+        )
+        self.n_jobs = n_jobs
+
+    def fit(self, X, y):
+        with threadpool_limits(limits=None if self.n_jobs == -1 else self.n_jobs):
+            return super().fit(X, y)
+
+    def predict_proba(self, X):
+        with threadpool_limits(limits=None if self.n_jobs == -1 else self.n_jobs):
+            return super().predict_proba(X)
+
+
 def _dual_etc(seed, n_jobs):
     """Shared ExtraTrees head used by the TSCGlueDual second-head "-etc" models."""
     return ExtraTreesClassifier(
@@ -192,7 +232,7 @@ def _dual_etc(seed, n_jobs):
     )
 
 
-def get_model_v6(name, seed=None, n_jobs=1, model_dir=None, **kwargs):
+def get_model_v6(name, seed=None, n_jobs=1, model_dir=None, prepruned_features=False, **kwargs):
     """Returns (DictMultiScaler, classifier) for feature/stacking models, or (None, pipe) for series models."""
     if name == "multirockethydra-ridgecv":
         scaler = DictMultiScaler(scalers={"hydra": SparseScaler(), "multirocket": StandardScaler()})
@@ -261,12 +301,12 @@ def get_model_v6(name, seed=None, n_jobs=1, model_dir=None, **kwargs):
         return scaler, clf
     elif name == "probability-rf":
         scaler = DictMultiScaler(scalers={"probabilities": NoScaler()})
-        clf = RandomForestClassifier(n_estimators=200, random_state=seed, n_jobs=-1)
+        clf = RandomForestClassifier(n_estimators=200, random_state=seed, n_jobs=n_jobs)
         return scaler, clf
     elif name == "probability-rf-balanced":
         scaler = DictMultiScaler(scalers={"probabilities": NoScaler()})
         clf = RandomForestClassifier(
-            n_estimators=200, class_weight="balanced", random_state=seed, n_jobs=-1
+            n_estimators=200, class_weight="balanced", random_state=seed, n_jobs=n_jobs
         )
         return scaler, clf
     elif name == "probability-nn":
@@ -293,7 +333,7 @@ def get_model_v6(name, seed=None, n_jobs=1, model_dir=None, **kwargs):
         return scaler, clf
     elif name == "multirockethydra-bestk-p-ridgecv":
         scaler = DictMultiScaler(scalers={"hydra": SparseScaler(), "multirocket": StandardScaler()})
-        clf = AutoSelectKBestClassifier()
+        clf = AutoSelectKBestClassifier(variance_filter=not prepruned_features)
         return scaler, clf
     elif name == "fm-dummy":
         from sklearn.dummy import DummyClassifier
@@ -303,7 +343,9 @@ def get_model_v6(name, seed=None, n_jobs=1, model_dir=None, **kwargs):
         return scaler, clf
     elif name == "weasel-bestk-p-ridgecv":
         scaler = DictMultiScaler(scalers={"weasel": NoScaler()})
-        clf = AutoSelectKBestClassifier(k=30000, score_func=chi2)
+        clf = AutoSelectKBestClassifier(
+            k=30000, score_func=chi2, variance_filter=not prepruned_features
+        )
         return scaler, clf
     elif name == "fm-p-ridgecv":
         scaler = DictMultiScaler(scalers={"mantis": StandardScaler(), "chronos2": StandardScaler()})
@@ -523,6 +565,10 @@ def _transform_in_subprocess(
     save_array(Xt, f"Xt_{feature_id}", output_dir)
 
 
+def _wrap_variance_filter(transformer):
+    return Pipeline([("features", transformer), ("var", VarianceThreshold())])
+
+
 def _fit_transform_in_subprocess(
     feature_name,
     feature_seed,
@@ -534,11 +580,14 @@ def _fit_transform_in_subprocess(
     dtype=np.float64,
     verbose=0,
     device="cpu",
+    variance_filter=False,
 ):
     X = np.load(X_path, allow_pickle=True)
     transformer = get_feature_transformer(
         feature_name, seed=feature_seed, n_jobs=n_jobs, device=device
     )
+    if variance_filter:
+        transformer = _wrap_variance_filter(transformer)
     t0 = perf_counter()
     Xt = transformer.fit_transform(X)
     if verbose >= 3:
@@ -568,11 +617,14 @@ def _fit_transform_inline(
     feature_id,
     dtype=np.float64,
     device="cpu",
+    variance_filter=False,
 ):
     X = np.load(X_path, allow_pickle=True)
     transformer = get_feature_transformer(
         feature_name, seed=feature_seed, n_jobs=n_jobs, device=device
     )
+    if variance_filter:
+        transformer = _wrap_variance_filter(transformer)
     Xt = transformer.fit_transform(X)
     save_model(transformer, f"transformer_{feature_id}", model_dir)
     if dtype is not None:
@@ -693,6 +745,10 @@ class LokyStackerV10Base(BaseClassifier):
     GPU_FEATURE_NAMES: tuple[str, ...] = ("mantis", "chronos2")
     NO_SUBPROCESS_FEATURES: set[str] = {"multirocket", "rdst"}
     NO_SUBPROCESS_FEATURES: set[str] = {"multirocket", "rdst"}
+    # Class-level default so every estimator has the attribute; ``TSCGlueEnhancedV4``
+    # promotes it to a constructor parameter. Read via the instance so a subclass that
+    # exposes it as a real parameter shadows this.
+    prune_constant: bool = False
 
     def _get_feature_names(self, model_name: str) -> tuple[str, ...]:
         """Return required feature type names for a model."""
@@ -791,7 +847,7 @@ class LokyStackerV10Base(BaseClassifier):
         verbose=0,
         model_names=None,
         n_repetitions=1,
-        feature_dtype=None,
+        compute_dtype=None,
         stacking_models=None,
         selection=None,
         n_gpus=0,
@@ -808,7 +864,7 @@ class LokyStackerV10Base(BaseClassifier):
         self.keep_features = bool(keep_features)
         self.verbose = int(verbose)
         self.n_repetitions = int(n_repetitions)
-        self.feature_dtype = np.dtype(feature_dtype) if feature_dtype is not None else None
+        self.compute_dtype = np.dtype(compute_dtype) if compute_dtype is not None else None
         self.stacking_models = (
             stacking_models if stacking_models is not None else [self.STACKING_MODEL]
         )
@@ -1131,9 +1187,10 @@ class LokyStackerV10Base(BaseClassifier):
                             str(self._model_dir),
                             directory,
                             ft.get_feature_id(),
-                            self.feature_dtype,
+                            self.compute_dtype,
                             self.verbose,
                             self._feature_device(ft.feature_name),
+                            self.prune_constant,
                         ),
                     )
                     _log_feature(ft, t0)
@@ -1156,9 +1213,10 @@ class LokyStackerV10Base(BaseClassifier):
                         str(self._model_dir),
                         directory,
                         ft.get_feature_id(),
-                        self.feature_dtype,
+                        self.compute_dtype,
                         self.verbose,
                         self._feature_device(ft.feature_name),
+                        self.prune_constant,
                     ),
                 )
             else:
@@ -1170,8 +1228,9 @@ class LokyStackerV10Base(BaseClassifier):
                     str(self._model_dir),
                     directory,
                     ft.get_feature_id(),
-                    self.feature_dtype,
+                    self.compute_dtype,
                     self._feature_device(ft.feature_name),
+                    self.prune_constant,
                 )
             _log_feature(ft, t0)
 
@@ -1207,7 +1266,7 @@ class LokyStackerV10Base(BaseClassifier):
                             X_path,
                             str(self._model_dir),
                             directory,
-                            self.feature_dtype,
+                            self.compute_dtype,
                             self.verbose,
                         ),
                     )
@@ -1228,7 +1287,7 @@ class LokyStackerV10Base(BaseClassifier):
                         X_path,
                         str(self._model_dir),
                         directory,
-                        self.feature_dtype,
+                        self.compute_dtype,
                         self.verbose,
                     ),
                 )
@@ -1238,7 +1297,7 @@ class LokyStackerV10Base(BaseClassifier):
                     X_path,
                     str(self._model_dir),
                     directory,
-                    self.feature_dtype,
+                    self.compute_dtype,
                 )
             _log_feature(ft, t0)
 
@@ -1259,8 +1318,8 @@ class LokyStackerV10Base(BaseClassifier):
 
     def _fit(self, X, y):
         fit_start = perf_counter()
-        if self.feature_dtype is None:
-            self.feature_dtype = np.asarray(X).dtype
+        if self.compute_dtype is None:
+            self.compute_dtype = np.asarray(X).dtype
         self.log(
             f"Starting fit, run_dir={self._base_dir}, n_jobs={self.n_jobs}",
             level=1,
@@ -1310,10 +1369,10 @@ class LokyStackerV10Base(BaseClassifier):
         os.makedirs(self._tmpdir, exist_ok=True)
 
         t0 = perf_counter()
-        save_array(X, "X", str(self._tmpdir), dtype=self.feature_dtype)
+        save_array(X, "X", str(self._tmpdir), dtype=self.compute_dtype)
         save_array(y, "y", str(self._tmpdir))
         self.log(
-            f"Saved X and y to disk in {perf_counter() - t0:.2f}s (dtype={self.feature_dtype})",
+            f"Saved X and y to disk in {perf_counter() - t0:.2f}s (dtype={self.compute_dtype})",
             level=2,
             start_time=fit_start,
         )
@@ -1379,7 +1438,11 @@ class LokyStackerV10Base(BaseClassifier):
                     start_time=fit_start,
                 )
 
-                futures = {executor.submit(_train_one_model_v10, *t): t for t in tasks}
+                base_kwargs = {"prepruned_features": self.prune_constant}
+                futures = {
+                    executor.submit(_train_one_model_v10, *t, model_kwargs=base_kwargs): t
+                    for t in tasks
+                }
                 model_groups = defaultdict(list)
                 model_train_times: dict[str, list[float]] = defaultdict(list)
 
@@ -1742,7 +1805,7 @@ class LokyStackerV10Base(BaseClassifier):
                 warm = [executor.submit(_noop) for _ in range(self.n_jobs)]
 
                 # compute features (transform-only; transformers already trained)
-                save_array(X, "X", str(features_infer), dtype=self.feature_dtype)
+                save_array(X, "X", str(features_infer), dtype=self.compute_dtype)
                 self.compute_features(X, str(features_infer), start_time=predict_start)
                 self.log(
                     "Computed and saved features for prediction", level=1, start_time=predict_start
@@ -1811,7 +1874,7 @@ class LokyStackerV10Base(BaseClassifier):
                     probability_columns=self._probability_columns,
                 )
 
-                save_array(X, "X", str(features_stack), dtype=self.feature_dtype)
+                save_array(X, "X", str(features_stack), dtype=self.compute_dtype)
                 save_array(prob_array, "Xt_probabilities", str(features_stack))
 
                 # ---- stacking predictions ----
@@ -2581,6 +2644,7 @@ class TSCGlueEnhancedV2(TSCGlueETAll):
         runs_dir=None,
         eval_metric="accuracy",
         preset="medium",
+        compute_dtype=None,
     ):
         assert n_gpus in (0, 1, -1), f"n_gpus must be 0, 1, or -1; got {n_gpus}"
         assert eval_metric in _VALID_EVAL_METRICS, (
@@ -2618,6 +2682,7 @@ class TSCGlueEnhancedV2(TSCGlueETAll):
             model_names=model_names,
             stacking_models=stacking_models,
             eval_metric=eval_metric,
+            compute_dtype=compute_dtype,
         )
 
     def _mean_members(self, pool=None) -> list[str]:
@@ -2726,6 +2791,70 @@ class TSCGlueEnhancedV3(TSCGlueEnhancedV2):
     """
 
     GPU_FEATURE_NAMES = ("hydra", "mantis", "chronos2")
+
+
+class TSCGlueEnhancedV4(TSCGlueEnhancedV3):
+    """TSCGlueEnhancedV3 that prunes constant feature columns as each block is built.
+
+    Every feature transformer is wrapped in ``Pipeline([("features", ...), ("var",
+    VarianceThreshold())])``, so columns that are constant across the training set are
+    dropped before the block is written to disk. Everything else -- presets, stacker
+    pools, served-head table, GPU hydra -- is inherited from V3 untouched.
+
+    The mask is fitted state inside the pickled pipeline, so predict-time
+    ``transform`` reloads it and selects the *same* columns. There is no separate mask
+    file, and train and test cannot disagree.
+
+    Why this is safe: a constant column carries no information. A tree cannot split on
+    it, ridge gives it a zero coefficient, and ``f_classif`` scores it NaN so
+    ``SelectKBest`` never picks it. Dropping it does not change what any model can learn.
+
+    Two consequences worth knowing:
+
+    * **It is not bit-identical to V3.** Ridge is unaffected, but estimators whose RNG
+      stream depends on ``n_features`` -- tree splitters, MLP weight init -- see a
+      different random realisation and produce different predictions at unchanged
+      accuracy. Compare accuracy distributions against V3, never exact outputs.
+    * **The payoff is very uneven across blocks.** Measured on a 150-case dataset of
+      16-point series: rdst 94.7% of columns dropped, weasel 23.9%, multirocket 2.0%,
+      and quant/hydra/rstsf-random 0.0%. rdst dominates because aeon's default
+      ``max_shapelets=10000`` is far more shapelets than short series can supply, so
+      most slots stay empty and emit all-zero triples. Capping ``max_shapelets`` would
+      beat filtering there, since it also avoids the extraction work.
+
+    Parameters
+    ----------
+    prune_constant : bool, default=True
+        Set ``False`` to get V3 behaviour with this class.
+    """
+
+    def __init__(
+        self,
+        random_state=None,
+        k_folds=10,
+        n_jobs=1,
+        verbose=0,
+        n_repetitions=1,
+        n_gpus=0,
+        runs_dir=None,
+        eval_metric="accuracy",
+        preset="medium",
+        prune_constant=True,
+        compute_dtype=None,
+    ):
+        super().__init__(
+            random_state=random_state,
+            k_folds=k_folds,
+            n_jobs=n_jobs,
+            verbose=verbose,
+            n_repetitions=n_repetitions,
+            n_gpus=n_gpus,
+            runs_dir=runs_dir,
+            eval_metric=eval_metric,
+            preset=preset,
+            compute_dtype=compute_dtype,
+        )
+        self.prune_constant = prune_constant
 
 
 class TSCGlueLogisticClassifier(LokyStackerV10RSTSFRandom):
@@ -3085,7 +3214,7 @@ class TSCGlueRegressor(BaseRegressor):
         )
         self._model_dir = self._base_dir / "models"
         self._tmpdir: Path = self._base_dir / "features_training"
-        self._feature_dtype: np.dtype | None = None
+        self._compute_dtype: np.dtype | None = None
 
         self.stacking_models = [self.STACKING_MODEL]
         self.model_specs = self._build_model_specs(self.DEFAULT_MODEL_NAMES)
@@ -3140,7 +3269,7 @@ class TSCGlueRegressor(BaseRegressor):
                         str(self._model_dir),
                         directory,
                         ft.get_feature_id(),
-                        self._feature_dtype,
+                        self._compute_dtype,
                         self.verbose,
                     ),
                 )
@@ -3153,7 +3282,7 @@ class TSCGlueRegressor(BaseRegressor):
                     str(self._model_dir),
                     directory,
                     ft.get_feature_id(),
-                    self._feature_dtype,
+                    self._compute_dtype,
                 )
             Xt = read_array(f"Xt_{ft.get_feature_id()}", directory)
             elapsed = perf_counter() - t0
@@ -3185,7 +3314,7 @@ class TSCGlueRegressor(BaseRegressor):
                         X_path,
                         str(self._model_dir),
                         directory,
-                        self._feature_dtype,
+                        self._compute_dtype,
                         self.verbose,
                     ),
                 )
@@ -3195,7 +3324,7 @@ class TSCGlueRegressor(BaseRegressor):
                     X_path,
                     str(self._model_dir),
                     directory,
-                    self._feature_dtype,
+                    self._compute_dtype,
                 )
             Xt = read_array(f"Xt_{ft.get_feature_id()}", directory)
             self.log(
@@ -3206,11 +3335,11 @@ class TSCGlueRegressor(BaseRegressor):
 
     def _fit(self, X, y):
         fit_start = perf_counter()
-        self._feature_dtype = np.asarray(X).dtype
+        self._compute_dtype = np.asarray(X).dtype
 
         os.makedirs(self._model_dir, exist_ok=True)
         os.makedirs(self._tmpdir, exist_ok=True)
-        save_array(X, "X", str(self._tmpdir), dtype=self._feature_dtype)
+        save_array(X, "X", str(self._tmpdir), dtype=self._compute_dtype)
         save_array(y, "y", str(self._tmpdir))
 
         self._fit_transform_features(X, fit_start_time=fit_start)
@@ -3483,7 +3612,7 @@ class TSCGlueRegressor(BaseRegressor):
             with ProcessPoolExecutor(max_workers=self.n_jobs, mp_context=mp_ctx) as executor:
                 [executor.submit(_noop) for _ in range(self.n_jobs)]
 
-                save_array(X, "X", str(features_infer), dtype=self._feature_dtype)
+                save_array(X, "X", str(features_infer), dtype=self._compute_dtype)
                 self._compute_features(X, str(features_infer), start_time=predict_start)
 
                 base_pred_folds = {spec.get_model_id(): [] for spec in self.model_specs}
@@ -3522,7 +3651,7 @@ class TSCGlueRegressor(BaseRegressor):
                     [base_preds[mid] for mid in self._stacking_model_order]
                 )
                 os.makedirs(features_stack, exist_ok=True)
-                save_array(X, "X", str(features_stack), dtype=self._feature_dtype)
+                save_array(X, "X", str(features_stack), dtype=self._compute_dtype)
                 save_array(stacking_matrix, "Xt_predictions", str(features_stack))
 
                 stack_pred_folds = {m: [] for m in self.stacking_models}
@@ -3564,34 +3693,33 @@ class SparseScaler:
         self.mask = mask
         self.exponent = exponent
 
-    def _prep(self, X):
-        return np.sqrt(np.clip(X, 0, None))
+    def _run(self, X, fit, scale):
+        Xt = np.clip(X, 0, None)
+        np.sqrt(Xt, out=Xt)
 
-    def _fit_stats(self, Xt, dtype):
-        # epsilon = mean((X == 0)) ** exponent + 1e-8 (bool array, no float copy needed)
-        zero_frac = (Xt == 0).mean(axis=0)
-        self.epsilon = zero_frac**self.exponent + 1e-8
+        if fit:
+            epsilon = (Xt == 0).mean(axis=0) ** self.exponent + 1e-8
+            self.mu = Xt.mean(axis=0)
+            self.sigma = (Xt.std(axis=0) + epsilon).astype(Xt.dtype)
+        if not scale:
+            return None
 
-        self.mu = Xt.mean(axis=0).astype(dtype)
-        self.sigma = (Xt.std(axis=0) + self.epsilon).astype(dtype)
-
-    def _apply(self, Xt):
-        if self.mask:
-            return ((Xt - self.mu) * (Xt != 0)) / self.sigma
-        else:
-            return (Xt - self.mu) / self.sigma
+        mask = (Xt != 0) if self.mask else None  # must precede the subtraction
+        Xt -= self.mu
+        if mask is not None:
+            Xt *= mask
+        Xt /= self.sigma
+        return Xt
 
     def fit(self, X, y=None):
-        self._fit_stats(self._prep(X), X.dtype)
+        self._run(X, fit=True, scale=False)
         return self
 
     def transform(self, X, y=None):
-        return self._apply(self._prep(X))
+        return self._run(X, fit=False, scale=True)
 
     def fit_transform(self, X, y=None):
-        Xt = self._prep(X)
-        self._fit_stats(Xt, X.dtype)
-        return self._apply(Xt)
+        return self._run(X, fit=True, scale=True)
 
 
 def select_rows(arr, idx):
@@ -3660,14 +3788,3 @@ class NoScaler(BaseEstimator, TransformerMixin):
         return X
 
 
-class RidgeClassifierCVIndicator(RidgeClassifierCV):
-    def predict_proba(self, X):
-        dists = np.zeros((X.shape[0], len(self.classes_)))
-        preds = self.predict(X)
-        for i in range(0, X.shape[0]):
-            dists[i, np.where(self.classes_ == preds[i])] = 1
-        return dists
-
-    def fit(self, X, y):
-        with threadpool_limits(limits=1):
-            return super().fit(X, y)

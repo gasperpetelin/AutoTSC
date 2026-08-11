@@ -320,7 +320,7 @@ def _build_et(n_estimators, n_jobs, random_state):
 
 
 def _build_ridge():
-    from tscglue.utils import RidgeClassifierCVDecisionProba
+    from tscglue.tabular import RidgeClassifierCVDecisionProba
 
     return RidgeClassifierCVDecisionProba(alphas=np.logspace(-3, 3, 10))
 

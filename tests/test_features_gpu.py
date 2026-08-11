@@ -7,7 +7,7 @@ from sklearn.metrics import accuracy_score
 from tscglue import utils
 from tscglue.features_gpu import HydraTransformerDevice
 from tscglue.models import SparseScaler
-from tscglue.utils import RidgeClassifierCVDecisionProba
+from tscglue.tabular import RidgeClassifierCVDecisionProba
 
 torch = pytest.importorskip("torch")
 

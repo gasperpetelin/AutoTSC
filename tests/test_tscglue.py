@@ -88,9 +88,9 @@ def test_classifier_eval_metrics_multiclass(eval_metric):
     np.testing.assert_allclose(proba.sum(axis=1), 1.0, atol=1e-6)
 
 
-@pytest.mark.parametrize("feature_dtype", [None, "float32", "float64"])
-def test_v10base_feature_dtype(feature_dtype):
-    """Test that LokyStackerV10Base fit+predict works with different feature_dtype values."""
+@pytest.mark.parametrize("compute_dtype", [None, "float32", "float64"])
+def test_v10base_compute_dtype(compute_dtype):
+    """Test that LokyStackerV10Base fit+predict works with different compute_dtype values."""
     X_train, y_train, X_test, y_test = utils.load_dataset("Coffee")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -98,7 +98,7 @@ def test_v10base_feature_dtype(feature_dtype):
             random_state=270,
             n_repetitions=1,
             k_folds=10,
-            feature_dtype=feature_dtype,
+            compute_dtype=compute_dtype,
             runs_dir=tmp_dir,
         )
         model.fit(X_train, y_train)
@@ -108,9 +108,9 @@ def test_v10base_feature_dtype(feature_dtype):
     assert accuracy > 0.1, f"Accuracy {accuracy} is too low (<=0.1)"
     assert accuracy <= 1.0, f"Accuracy {accuracy} is invalid (>1.0)"
 
-    expected_dtype = np.dtype(feature_dtype) if feature_dtype else X_train.dtype
-    assert model.feature_dtype == expected_dtype, (
-        f"Expected feature_dtype={expected_dtype}, got {model.feature_dtype}"
+    expected_dtype = np.dtype(compute_dtype) if compute_dtype else X_train.dtype
+    assert model.compute_dtype == expected_dtype, (
+        f"Expected compute_dtype={expected_dtype}, got {model.compute_dtype}"
     )
 
 
