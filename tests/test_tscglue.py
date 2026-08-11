@@ -132,12 +132,16 @@ def test_label_dtype(encode_labels):
         )
         model.fit(X_train, y_train_fit)
         y_pred = model.predict(X_test)
+        served_proba = model.predict_proba(X_test)
         proba_per_model = model.predict_proba_per_model(X_test)
-        best_proba = proba_per_model[model.best_model]
 
     assert y_pred.shape == y_test_expected.shape
-    assert best_proba.shape == (X_test.shape[0], len(model.classes_))
-    assert np.isfinite(best_proba).all()
+    assert served_proba.shape == (X_test.shape[0], len(model.classes_))
+    assert np.isfinite(served_proba).all()
+    assert proba_per_model, "no per-model probabilities returned"
+    for name, proba in proba_per_model.items():
+        assert proba.shape == (X_test.shape[0], len(model.classes_)), name
+        assert np.isfinite(proba).all(), name
 
     accuracy = accuracy_score(y_test_expected, y_pred)
     assert accuracy > 0.1, f"Accuracy {accuracy} is too low (<=0.1)"
