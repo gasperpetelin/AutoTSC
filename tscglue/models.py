@@ -1616,7 +1616,7 @@ class LokyStackerV10Base(BaseClassifier):
                 model_name = f[5:-4]
                 prob_array = read_array(f"pred_{model_name}", d)
                 meta = read_array(f"pred_{model_name}_meta", d, allow_pickle=True, mmap_mode=None)
-                level, classes = int(meta[0]), list(meta[1:])
+                _, classes = int(meta[0]), list(meta[1:])
                 schema = [f"{model_name}|{cls}" for cls in classes]
                 frames.append(pl.DataFrame(prob_array, schema=schema))
         return pl.DataFrame() if not frames else pl.concat(frames, how="horizontal")
@@ -2967,7 +2967,6 @@ def _train_one_model_reg(
     feature_specs,
     model_dir,
 ):
-    X = read_array("X", directory)
     y = read_array("y", directory)
     feature_dict = _load_feature_dict_v10(directory, feature_specs)
     scaler, reg = get_model_reg(model_name, seed=model_seed)
