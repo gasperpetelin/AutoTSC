@@ -130,7 +130,7 @@ class ThreadBudgetMLPClassifier(MLPClassifier):
 
 
 def _dual_etc(seed, n_jobs):
-    """Shared ExtraTrees head used by the TSCGlueDual second-head "-etc" models."""
+    """Shared ExtraTrees head used by the second-head "-etc" models of the ``high`` preset."""
     return ExtraTreesClassifier(
         n_estimators=200,
         criterion="entropy",
@@ -651,7 +651,6 @@ class LokyStackerV10Base(BaseClassifier):
     # features are queued in the background device lane and which are built with
     # ``self._device``; the order is the order the lane runs them in.
     GPU_FEATURE_NAMES: tuple[str, ...] = ("mantis", "chronos2")
-    NO_SUBPROCESS_FEATURES: set[str] = {"multirocket", "rdst"}
     NO_SUBPROCESS_FEATURES: set[str] = {"multirocket", "rdst"}
     # Class-level default so every estimator has the attribute; ``TSCGlueEnhancedV4``
     # promotes it to a constructor parameter. Read via the instance so a subclass that
@@ -1855,44 +1854,44 @@ class LokyStackerV10Base(BaseClassifier):
         }
 
 
-class LokyStackerV10RSTSFRandom(LokyStackerV10Base):
-    """Splits RSTSF into a feature extraction transformer (RandomIntervals on 4 series
-    representations) and a separately trained ExtraTreesClassifier. SERIES_MODELS is
-    empty so all models go through the feature caching pipeline.
-    """
+# ---------------------------------------------------------------------------
+# Level-0 (base) pools, one per preset. Single source of truth: the classes
+# below select among these rather than each redeclaring a list.
+# ---------------------------------------------------------------------------
 
-    DEFAULT_MODEL_NAMES = [
-        "multirockethydra-bestk-p-ridgecv",
-        "quant-etc",
-        "rdst-p-ridgecv",
-        "rstsf-random-etc",
-        "fm-p-ridgecv",
-    ]
-    SERIES_MODELS = []
-    NO_SUBPROCESS_FEATURES: set[str] = {"multirocket", "rdst", "rstsf-random"}
+# The five representations every preset builds on.
+_ENHANCED_BASE_MODELS = [
+    "multirockethydra-bestk-p-ridgecv",
+    "quant-etc",
+    "rdst-p-ridgecv",
+    "rstsf-random-etc",
+    "fm-p-ridgecv",
+]
 
+# low = medium minus the ``weasel`` and ``fm`` representations (README preset table).
+_ENHANCED_LOW_MODELS = [name for name in _ENHANCED_BASE_MODELS if name != "fm-p-ridgecv"]
 
-class LokyStackerV10RSTSFRandomMultiStack(LokyStackerV10RSTSFRandom):
-    """LokyStackerV10RSTSFRandom with multiple stacking models for best-stacking selection experiments."""
+# medium = the base five plus weasel.
+_ENHANCED_MEDIUM_MODELS = _ENHANCED_BASE_MODELS + ["weasel-bestk-p-ridgecv"]
 
-    STACKING_MODEL = "probability-ridgecv"
-
-    def __init__(
-        self, random_state=None, k_folds=10, n_jobs=1, verbose=0, selection="best-stacking"
-    ):
-        super().__init__(
-            random_state=random_state,
-            k_folds=k_folds,
-            n_jobs=n_jobs,
-            verbose=verbose,
-            stacking_models=[
-                "probability-ridgecv",
-                "probability-et",
-                "probability-nn",
-                "probability-rf",
-            ],
-            selection=selection,
-        )
+# high = every representation twice, once behind a RidgeCV head and once behind an
+# ExtraTrees head. All names are distinct, so build_model_specs puts them in one
+# group with a single FeatureSpec/seed per feature name: each representation is
+# computed exactly once and feeds both of its heads.
+_ENHANCED_HIGH_MODELS = [
+    "multirockethydra-bestk-p-ridgecv",
+    "multirockethydra-etc",
+    "quant-etc",
+    "quant-p-ridgecv",
+    "rdst-p-ridgecv",
+    "rdst-etc",
+    "rstsf-random-etc",
+    "rstsf-random-p-ridgecv",
+    "fm-p-ridgecv",
+    "fm-etc",
+    "weasel-bestk-p-ridgecv",
+    "weasel-etc",
+]
 
 
 def _robust_r2(y, pred):
@@ -1925,572 +1924,35 @@ def generate_folds(X, y, n_splits=5, n_repetitions=5, random_state=0, stratify=T
 _VALID_EVAL_METRICS = {"accuracy", "f1", "log_loss", "roc_auc"}
 
 
-class TSCGlueClassifier(LokyStackerV10RSTSFRandom):
-    def __init__(
-        self,
-        random_state=None,
-        k_folds=10,
-        n_jobs=1,
-        verbose=0,
-        n_repetitions=1,
-        n_gpus=0,
-        runs_dir=None,
-        eval_metric="accuracy",
-        time_limit=None,
-    ):
-        assert n_gpus in (0, 1, -1), f"n_gpus must be 0, 1, or -1; got {n_gpus}"
-        assert eval_metric in _VALID_EVAL_METRICS, f"eval_metric must be one of {_VALID_EVAL_METRICS}; got {eval_metric!r}"
-        assert time_limit is None, "time_limit is currently not supported"
-        # Hardcoded best stacker per metric (from the critical-difference study):
-        # ridge wins on accuracy; ExtraTrees wins log-loss and AUC. f1 follows the
-        # README proposal of matching accuracy (ridge).
-        stacking = {
-            "accuracy": ["probability-ridgecv"],
-            "f1": ["probability-ridgecv"],
-            "log_loss": ["probability-et"],
-            "roc_auc": ["probability-et"],
-        }[eval_metric]
-        super().__init__(
-            random_state=random_state,
-            n_repetitions=n_repetitions,
-            k_folds=k_folds,
-            n_jobs=n_jobs,
-            keep_features=False,
-            verbose=verbose,
-            n_gpus=n_gpus,
-            runs_dir=runs_dir,
-            stacking_models=stacking,
-            eval_metric=eval_metric,
-        )
-        self.time_limit = time_limit
-
-
-class TSCGlueWeaselV2(TSCGlueClassifier):
-    """TSCGlueClassifier plus the WEASELTransformerV2 feature/model."""
-
-    DEFAULT_MODEL_NAMES = LokyStackerV10RSTSFRandom.DEFAULT_MODEL_NAMES + [
-        "weasel-bestk-p-ridgecv"
-    ]
-
-
-class TSCGlueDual(TSCGlueClassifier):
-    """TSCGlueWeaselV2 with both a RidgeCV and an ExtraTrees head per base representation.
-
-    Each representation is computed once (all names are distinct, so build_model_specs
-    puts them in one group with a single FeatureSpec/seed per feature name) and feeds
-    two level-0 models whose OOF probabilities are stacked together.
-    """
-
-    DEFAULT_MODEL_NAMES = [
-        "multirockethydra-bestk-p-ridgecv",
-        "multirockethydra-etc",
-        "quant-etc",
-        "quant-p-ridgecv",
-        "rdst-p-ridgecv",
-        "rdst-etc",
-        "rstsf-random-etc",
-        "rstsf-random-p-ridgecv",
-        "fm-p-ridgecv",
-        "fm-etc",
-        "weasel-bestk-p-ridgecv",
-        "weasel-etc",
-    ]
-
-
-class TSCGlueBrierSelect(TSCGlueWeaselV2):
-    """TSCGlueWeaselV2 with several competing stackers, serving the OOF Brier winner.
-
-    OOF accuracy is a 0/1 count statistic and too noisy to pick a winner on
-    small datasets, so the served stacker is the one with the lowest OOF
-    multiclass Brier score instead — smooth and bounded, so tree stackers
-    emitting exact-0 probabilities aren't catastrophically punished the way
-    log-loss would. A virtual level-2 candidate — the element-wise mean of the
-    calibrated stackers' probabilities — competes alongside the individual
-    stackers. ``eval_metric`` only affects the scores reported in
-    ``summary()``, not which stacker is served.
-    """
-
-    DEFAULT_STACKING_MODELS = [
-        "probability-ridgecv",
-        "probability-logisticcv",
-        "probability-et",
-        "probability-nn",
-        "probability-rf",
-    ]
-
-    # Virtual candidate averaging the stackers' probabilities. Ridge is excluded
-    # because its decision-function pseudo-probabilities are uncalibrated and
-    # would poison the mean.
-    MEAN_STACKER_NAME = "probability-stack-mean"
-    MEAN_STACKER_EXCLUDE = ("probability-ridgecv",)
-
-    def __init__(
-        self,
-        random_state=None,
-        k_folds=10,
-        n_jobs=1,
-        verbose=0,
-        n_repetitions=1,
-        n_gpus=0,
-        runs_dir=None,
-        eval_metric="accuracy",
-        stacking_models=None,
-    ):
-        assert n_gpus in (0, 1, -1), f"n_gpus must be 0, 1, or -1; got {n_gpus}"
-        assert eval_metric in _VALID_EVAL_METRICS, f"eval_metric must be one of {_VALID_EVAL_METRICS}; got {eval_metric!r}"
-        # Skips TSCGlueClassifier.__init__: its only job is hardcoding one
-        # stacker per eval_metric, which the competing pool replaces.
-        LokyStackerV10RSTSFRandom.__init__(
-            self,
-            random_state=random_state,
-            n_repetitions=n_repetitions,
-            k_folds=k_folds,
-            n_jobs=n_jobs,
-            keep_features=False,
-            verbose=verbose,
-            n_gpus=n_gpus,
-            runs_dir=runs_dir,
-            stacking_models=(
-                list(stacking_models)
-                if stacking_models is not None
-                else list(self.DEFAULT_STACKING_MODELS)
-            ),
-            eval_metric=eval_metric,
-        )
-
-    def _mean_members(self) -> list[str]:
-        return [m for m in self.stacking_models if m not in self.MEAN_STACKER_EXCLUDE]
-
-    @staticmethod
-    def _brier(proba, y_true, classes) -> float:
-        onehot = (
-            np.asarray(y_true, dtype=str)[:, None] == np.asarray(classes, dtype=str)[None, :]
-        ).astype(np.float64)
-        return float(np.mean(np.sum((proba - onehot) ** 2, axis=1)))
-
-    def _oof_brier_score(self, y, model_name) -> float:
-        prob_array, _level, classes = self._load_model_predictions(model_name)
-        valid = ~np.isnan(prob_array).any(axis=1)
-        if not np.any(valid):
-            return float("inf")
-        return self._brier(prob_array[valid], y[valid], classes)
-
-    def _oof_mean_brier_score(self, y, members) -> float:
-        arrays, classes_ref = [], None
-        valid = np.ones(len(y), dtype=bool)
-        for name in members:
-            prob_array, _level, classes = self._load_model_predictions(name)
-            if classes_ref is None:
-                classes_ref = classes
-            elif classes != classes_ref:
-                raise ValueError(f"Stacker class orderings differ: {classes} vs {classes_ref}")
-            valid &= ~np.isnan(prob_array).any(axis=1)
-            arrays.append(prob_array)
-        if not np.any(valid):
-            return float("inf")
-        mean_proba = np.mean([a[valid] for a in arrays], axis=0)
-        return self._brier(mean_proba, y[valid], classes_ref)
-
-    def _select_best_model(self):
-        y = read_array("y", str(self._require_tmpdir()))
-        brier_scores = {name: self._oof_brier_score(y, name) for name in self.stacking_models}
-        members = self._mean_members()
-        if len(members) >= 2:
-            brier_scores[self.MEAN_STACKER_NAME] = self._oof_mean_brier_score(y, members)
-        for name, score in brier_scores.items():
-            self._oof_scores.append(
-                {
-                    "model": name,
-                    "level": 2 if name == self.MEAN_STACKER_NAME else 1,
-                    "eval_metric": "brier",
-                    "oof_score": score,
-                    "train_time": None,
-                }
-            )
-            self.log(f"OOF brier (stack) {name}: {score}", level=1)
-        self.best_model = min(brier_scores, key=brier_scores.get)
-        self.log(f"Selected stacker by OOF Brier: {self.best_model}", level=1)
-
-    def _predict_proba(self, X):
-        if self.best_model != self.MEAN_STACKER_NAME or self._fallback_path.exists():
-            return super()._predict_proba(X)
-        probas = self.predict_proba_per_model(X)
-        return np.mean([probas[m] for m in self._mean_members()], axis=0)
-
-
-class TSCGlueMean(TSCGlueBrierSelect):
-    """TSCGlueBrierSelect on the TSCGlueDual base pool, always serving the stack-mean.
-
-    Level 0 uses the TSCGlueDual model list: every representation feeds both a
-    RidgeCV and an ExtraTrees head (12 base models). Stacking is identical to
-    TSCGlueBrierSelect (same competing stackers; per-stacker Brier scores are
-    still computed and reported in ``summary()``), but predictions always use
-    the element-wise mean of the calibrated stackers' probabilities
-    (``MEAN_STACKER_EXCLUDE`` members excluded).
-    """
-
-    DEFAULT_MODEL_NAMES = TSCGlueDual.DEFAULT_MODEL_NAMES
-
-    def _select_best_model(self):
-        super()._select_best_model()
-        self.best_model = self.MEAN_STACKER_NAME
-        self.log(f"Serving stack-mean: {self.best_model}", level=1)
-
-
-class TSCGlueMeanV2(TSCGlueMean):
-    """TSCGlueMean with a probabilistic fallback.
-
-    The fallback is MRHydraET (multirocket+hydra features, ExtraTrees head with
-    clipped probabilities) instead of the ridge-based MultiRocketHydraClassifier,
-    whose one-hot probabilities cost ~34.5 log-loss per misclassified sample on
-    fallback datasets. The main pipeline is identical to TSCGlueMean.
-    """
-
-    def _fit_fallback(self, X, y, fit_start_time):
-        # Local import: tscglue.fallback imports from this module.
-        from tscglue.fallback import MRHydraET
-
-        self.log("Falling back to MRHydraET", level=1, start_time=fit_start_time)
-        fallback = MRHydraET(random_state=self.random_state, n_jobs=self.n_jobs)
-        fallback.fit(X, y)
-        save_model(fallback, "fallback", str(self._model_dir))
-        self.log("Fallback model trained successfully", level=1, start_time=fit_start_time)
-
-
-class TSCGlueMeanBalanced(TSCGlueMean):
-    """TSCGlueMean with class-weight-balanced stackers.
-
-    Base pool, stack-mean serving and Brier diagnostics are identical to
-    TSCGlueMean; only the level-1 pool changes: RidgeCV, LogisticCV, ExtraTrees
-    and RandomForest are all fit with ``class_weight="balanced"``, so a minority
-    class contributes as much loss as a majority one. ``probability-nn`` stays
-    as-is — MLPClassifier has no ``class_weight`` (and no ``sample_weight`` in
-    ``fit``), so there is nothing to balance. The balanced stackers use distinct
-    model names, so their OOF predictions never collide with the unbalanced ones.
-    """
-
-    DEFAULT_STACKING_MODELS = [
-        "probability-ridgecv-balanced",
-        "probability-logisticcv-balanced",
-        "probability-et-balanced",
-        "probability-nn",
-        "probability-rf-balanced",
-    ]
-
-    # Same rationale as the parent: ridge's decision-function pseudo-probabilities
-    # are uncalibrated and would poison the mean.
-    MEAN_STACKER_EXCLUDE = ("probability-ridgecv-balanced",)
-
-
-class TSCGlueET(TSCGlueBrierSelect):
-    """Three-layer stack: TSCGlueDual base pool, five stackers, level-2 ExtraTrees.
-
-    Level 0: the TSCGlueDual model list (12 base models). Level 1: the same five
-    competing stackers as TSCGlueMean, trained on the base models' OOF
-    probabilities. Level 2: an ExtraTreesClassifier trained on the concatenated
-    OOF probabilities of all level-1 stackers; its predictions are served.
-    Level-1 stacker OOF rows come from fold models that never saw those rows,
-    so the level-2 training inputs are leak-free. Per-stacker Brier scores are
-    still computed and reported in ``summary()`` as diagnostics.
-    """
-
-    DEFAULT_MODEL_NAMES = TSCGlueDual.DEFAULT_MODEL_NAMES
-    LEVEL2_NAME = "probability-et-l2"
-
-    def _level2_input_models(self) -> list[str]:
-        """Model names whose OOF/test probabilities feed the level-2 model."""
-        return list(self.stacking_models)
-
-    def _level2_oof_matrix(self, y):
-        """Concatenate input models' OOF probabilities into the level-2 training matrix.
-
-        Each block is reordered to ``self.classes_`` column order so the matrix
-        matches what ``predict_proba_per_model`` produces at predict time.
-        """
-        blocks, classes_ref = [], None
-        valid = np.ones(len(y), dtype=bool)
-        for name in self._level2_input_models():
-            prob_array, _level, classes = self._load_model_predictions(name)
-            if classes_ref is None:
-                classes_ref = classes
-            elif classes != classes_ref:
-                raise ValueError(f"Model class orderings differ: {classes} vs {classes_ref}")
-            meta_to_col = {str(c): i for i, c in enumerate(classes)}
-            idx = [meta_to_col[str(c)] for c in self.classes_]
-            valid &= ~np.isnan(prob_array).any(axis=1)
-            blocks.append(np.asarray(prob_array)[:, idx])
-        return np.hstack(blocks), valid
-
-    def _make_level2_model(self, seed):
-        """Build the level-2 estimator served on top of the stacker/base OOF
-        matrix. Subclasses can swap in a different head; it only needs
-        ``fit`` / ``predict_proba`` / ``classes_``.
-        """
-        return ExtraTreesClassifier(n_estimators=1000, random_state=seed, n_jobs=self.n_jobs)
-
-    def _select_best_model(self):
-        from sklearn.model_selection import StratifiedKFold, cross_val_predict
-
-        super()._select_best_model()
-
-        y = read_array("y", str(self._require_tmpdir()))
-        X2, valid = self._level2_oof_matrix(y)
-        y_valid = np.asarray(y[valid])
-
-        # Rows with NaN OOF probabilities are dropped above; if that drops a class
-        # entirely the level-2 head could not predict it, so serve the fallback.
-        missing = self._missing_classes(np.unique(y_valid))
-        if missing:
-            self.log(
-                f"Level-2 training rows cover {self.n_classes_ - len(missing)}/"
-                f"{self.n_classes_} classes (missing {missing}), level-2 head not trainable",
-                level=1,
-            )
-            self._fit_fallback(read_array("X", str(self._require_tmpdir())), y, None)
-            return
-
-        seed = self._get_feature_seed()
-        self.level2_model_ = self._make_level2_model(seed)
-
-        # Diagnostic OOF Brier for the level-2 model itself, comparable to the
-        # stacker/mean rows appended by super().
-        counts = np.unique(y_valid, return_counts=True)[1]
-        n_splits = int(min(self.k_folds, counts.min()))
-        if n_splits >= 2:
-            oof = cross_val_predict(
-                self.level2_model_,
-                X2[valid],
-                y_valid,
-                cv=StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed),
-                method="predict_proba",
-            )
-            l2_brier = self._brier(oof, y_valid, np.unique(y_valid))
-            self._oof_scores.append(
-                {
-                    "model": self.LEVEL2_NAME,
-                    "level": 2,
-                    "eval_metric": "brier",
-                    "oof_score": l2_brier,
-                    "train_time": None,
-                }
-            )
-            self.log(f"OOF brier (level-2) {self.LEVEL2_NAME}: {l2_brier}", level=1)
-
-        self.level2_model_.fit(X2[valid], y_valid)
-        self.best_model = self.LEVEL2_NAME
-        self.log(f"Serving level-2 model: {self.best_model}", level=1)
-
-    def _predict_proba(self, X):
-        if self._fallback_path.exists() or getattr(self, "level2_model_", None) is None:
-            return super()._predict_proba(X)
-        probas = self.predict_proba_per_model(X)
-        X2 = np.hstack([probas[name] for name in self._level2_input_models()])
-        proba = self.level2_model_.predict_proba(X2)
-        # Align the level-2 model's column order with self.classes_ (usually already matching).
-        l2_classes = np.asarray(self.level2_model_.classes_, dtype=str)
-        order = [int(np.where(l2_classes == s)[0][0]) for s in np.asarray(self.classes_, dtype=str)]
-        return proba[:, order]
-
-
-class TSCGlueETAll(TSCGlueET):
-    """TSCGlueET whose level-2 ExtraTrees also sees the base models' probabilities.
-
-    Level-2 input = the five stackers' OOF probabilities plus the 12 base
-    models' OOF probabilities (a stacking skip connection). Everything else —
-    base pool, stackers, diagnostics, serving — is identical to TSCGlueET.
-    """
-
-    LEVEL2_NAME = "probability-et-l2-all"
-
-    def _level2_input_models(self) -> list[str]:
-        base_ids = sorted(spec.get_model_id() for spec in self.model_specs)
-        return list(self.stacking_models) + base_ids
-
-
-class TSCGlueETAllV2(TSCGlueETAll):
-    """TSCGlueETAll with a probabilistic fallback.
-
-    The fallback is MRHydraET (multirocket+hydra features, ExtraTrees head with
-    clipped probabilities) instead of the ridge-based MultiRocketHydraClassifier,
-    whose one-hot probabilities cost ~34.5 log-loss per misclassified sample on
-    fallback datasets. The main pipeline is identical to TSCGlueETAll.
-    """
-
-    def _fit_fallback(self, X, y, fit_start_time):
-        # Local import: tscglue.fallback imports from this module.
-        from tscglue.fallback import MRHydraET
-
-        self.log("Falling back to MRHydraET", level=1, start_time=fit_start_time)
-        fallback = MRHydraET(random_state=self.random_state, n_jobs=self.n_jobs)
-        fallback.fit(X, y)
-        save_model(fallback, "fallback", str(self._model_dir))
-        self.log("Fallback model trained successfully", level=1, start_time=fit_start_time)
-
-
-class TSCGlueRidgeAll(TSCGlueETAll):
-    """TSCGlueETAll with a RidgeCV level-2 head instead of ExtraTrees.
-
-    Identical to TSCGlueETAll — TSCGlueDual base pool (12 models), the same five
-    stackers, and a level-2 input of the stackers' *and* the base models' OOF
-    probabilities — except the level-2 combiner is the same ridge used by the
-    ``probability-ridgecv`` stacker: a ``RidgeClassifierCVIndicator`` behind a
-    ``StandardScaler``. Its probabilities are one-hot (all mass on the predicted
-    class), exactly like ``TSCGlueClassifier(eval_metric="accuracy")``'s served
-    head, just fed the stacker+base probability matrix instead of base features.
-    """
-
-    LEVEL2_NAME = "probability-ridge-l2-all"
-
-    def _make_level2_model(self, seed):
-        # Same configuration as the probability-ridgecv stacker: standardise the
-        # probability inputs, then a one-hot RidgeClassifierCVIndicator. Ridge is
-        # deterministic, so seed is unused.
-        return Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                ("ridge", RidgeClassifierCVIndicator(alphas=np.logspace(-3, 3, 20))),
-            ]
-        )
-
-
 _ENHANCED_PRESETS = ("low", "medium", "high")
 
-# low = medium minus the ``weasel`` and ``fm`` representations (README preset table).
-_ENHANCED_LOW_MODELS = [
-    name for name in LokyStackerV10RSTSFRandom.DEFAULT_MODEL_NAMES if name != "fm-p-ridgecv"
-]
-
-# The single low-preset stacker, chosen by ``eval_metric`` (same mapping as
-# TSCGlueClassifier): ridge for accuracy/f1, ExtraTrees for log_loss/roc_auc.
-# ``f1`` follows the README's proposal of matching accuracy (ridge).
-_ENHANCED_LOW_STACKER = {
-    "accuracy": ["probability-ridgecv"],
-    "f1": ["probability-ridgecv"],
-    "log_loss": ["probability-et"],
-    "roc_auc": ["probability-et"],
-}
-
-
-class TSCGlueEnhanced(TSCGlueETAll):
-    """Preset-composed TSCGlue stack — one class, three presets (low/medium/high).
-
-    Implements the preset composition the README documents. A single ``preset``
-    axis selects the level-0 representation/head pool, the level-1 stacker pool
-    and the level-2 serving head; the MRHydraET fallback is shared by all three.
-
-    ============ ============================ ========================= ==========================
-    preset       level 0 (base heads)         level 1 (stackers)        level 2 (served)
-    ============ ============================ ========================= ==========================
-    ``low``      4 reps, 1 head each           1, by ``eval_metric``     the single stacker, direct
-    ``medium``   6 reps, 1 head each           5 competing stackers      ``probability-stack-mean``
-    ``high``     6 reps, 2 heads each (12)      5 competing stackers      ``probability-et-l2-all``
-    ============ ============================ ========================= ==========================
-
-    * ``low`` = ``medium`` minus the ``weasel`` and ``fm`` representations. It
-      trains exactly one stacker, chosen by ``eval_metric`` (``probability-ridgecv``
-      for ``accuracy``/``f1``, ``probability-et`` for ``log_loss``/``roc_auc``), and
-      serves it directly — no Brier selection, no level-2 head.
-    * ``medium`` uses the six-representation ``TSCGlueWeaselV2`` base pool, trains
-      all five stackers and serves the element-wise mean of the calibrated ones
-      (ridge excluded, as in TSCGlueMean).
-    * ``high`` uses the twelve-model ``TSCGlueDual`` base pool (two heads per
-      representation), trains all five stackers and serves an ExtraTrees level-2
-      head fed by the stackers' *and* the base models' OOF probabilities
-      (TSCGlueETAll).
-
-    All presets fall back to MRHydraET when the stack cannot be built (a class
-    with fewer than two instances, NaNs in the assembled OOF matrix, or a fitted
-    model whose ``classes_`` does not cover every class in ``y``).
-    """
-
-    def __init__(
-        self,
-        random_state=None,
-        k_folds=10,
-        n_jobs=1,
-        verbose=0,
-        n_repetitions=1,
-        n_gpus=0,
-        runs_dir=None,
-        eval_metric="accuracy",
-        preset="high",
-    ):
-        assert n_gpus in (0, 1, -1), f"n_gpus must be 0, 1, or -1; got {n_gpus}"
-        assert eval_metric in _VALID_EVAL_METRICS, (
-            f"eval_metric must be one of {_VALID_EVAL_METRICS}; got {eval_metric!r}"
-        )
-        assert preset in _ENHANCED_PRESETS, (
-            f"preset must be one of {_ENHANCED_PRESETS}; got {preset!r}"
-        )
-        self.preset = preset
-
-        if preset == "low":
-            model_names = list(_ENHANCED_LOW_MODELS)
-            stacking_models = list(_ENHANCED_LOW_STACKER[eval_metric])
-        elif preset == "medium":
-            model_names = list(TSCGlueWeaselV2.DEFAULT_MODEL_NAMES)
-            stacking_models = list(self.DEFAULT_STACKING_MODELS)
-        else:  # high
-            model_names = list(TSCGlueDual.DEFAULT_MODEL_NAMES)
-            stacking_models = list(self.DEFAULT_STACKING_MODELS)
-
-        # Skips the intermediate __init__s (they hardcode the pool/stackers this
-        # preset logic replaces), matching how TSCGlueBrierSelect initialises.
-        LokyStackerV10RSTSFRandom.__init__(
-            self,
-            random_state=random_state,
-            n_repetitions=n_repetitions,
-            k_folds=k_folds,
-            n_jobs=n_jobs,
-            keep_features=False,
-            verbose=verbose,
-            n_gpus=n_gpus,
-            runs_dir=runs_dir,
-            model_names=model_names,
-            stacking_models=stacking_models,
-            eval_metric=eval_metric,
-        )
-
-    def _select_best_model(self):
-        if self.preset == "high":
-            # Level-2 ExtraTrees over stacker + base OOF (TSCGlueETAll).
-            super()._select_best_model()
-        elif self.preset == "medium":
-            # Brier diagnostics, then always serve the stack-mean (TSCGlueMean).
-            TSCGlueBrierSelect._select_best_model(self)
-            self.best_model = self.MEAN_STACKER_NAME
-            self.log(f"Serving stack-mean: {self.best_model}", level=1)
-        else:
-            # low: serve the single eval_metric-chosen stacker directly. selection
-            # is None, so this keeps best_model = stacking_models[0] from __init__.
-            LokyStackerV10Base._select_best_model(self)
-
-    def _fit_fallback(self, X, y, fit_start_time):
-        # Local import: tscglue.fallback imports from this module.
-        from tscglue.fallback import MRHydraET
-
-        self.log("Falling back to MRHydraET", level=1, start_time=fit_start_time)
-        fallback = MRHydraET(random_state=self.random_state, n_jobs=self.n_jobs)
-        fallback.fit(X, y)
-        save_model(fallback, "fallback", str(self._model_dir))
-        self.log("Fallback model trained successfully", level=1, start_time=fit_start_time)
-
-
-# Level-1 pools for TSCGlueEnhancedV2. ``high`` is the union of the plain and
+# Level-1 pools. ``high`` is the union of the plain and
 # balanced pools; ``probability-nn`` is a member of both (MLPClassifier has no
 # ``class_weight``, so there is no balanced counterpart to add), which is why the
 # union has 9 members and not 10.
-_ENHANCED_V2_PLAIN_STACKERS = list(TSCGlueBrierSelect.DEFAULT_STACKING_MODELS)
-_ENHANCED_V2_BALANCED_STACKERS = list(TSCGlueMeanBalanced.DEFAULT_STACKING_MODELS)
-_ENHANCED_V2_HIGH_STACKERS = _ENHANCED_V2_PLAIN_STACKERS + [
-    name for name in _ENHANCED_V2_BALANCED_STACKERS if name not in _ENHANCED_V2_PLAIN_STACKERS
+_ENHANCED_PLAIN_STACKERS = [
+    "probability-ridgecv",
+    "probability-logisticcv",
+    "probability-et",
+    "probability-nn",
+    "probability-rf",
+]
+_ENHANCED_BALANCED_STACKERS = [
+    "probability-ridgecv-balanced",
+    "probability-logisticcv-balanced",
+    "probability-et-balanced",
+    "probability-nn",
+    "probability-rf-balanced",
+]
+_ENHANCED_HIGH_STACKERS = _ENHANCED_PLAIN_STACKERS + [
+    name for name in _ENHANCED_BALANCED_STACKERS if name not in _ENHANCED_PLAIN_STACKERS
 ]
 
 # The served head for every (preset, eval_metric) pair. At ``medium``/``high``
 # every head is trained regardless, so eval_metric only picks which already
 # fitted head is served — no extra compute. At ``low`` a single stacker is
 # trained, so this table is also read in __init__ to decide *which* one.
-_ENHANCED_V2_SERVED_HEAD = {
+_ENHANCED_SERVED_HEAD = {
     ("low", "accuracy"): "probability-ridgecv",
     ("low", "f1"): "probability-et",
     ("low", "roc_auc"): "probability-et",
@@ -2506,13 +1968,12 @@ _ENHANCED_V2_SERVED_HEAD = {
 }
 
 
-class TSCGlueEnhancedV2(TSCGlueETAll):
+class TSCGlueEnhancedV3(LokyStackerV10Base):
     """Preset-composed TSCGlue stack whose served head also depends on ``eval_metric``.
 
-    Same three-preset composition axis as :class:`TSCGlueEnhanced`, but the
-    level-2 serving decision is a lookup on ``(preset, eval_metric)`` rather than
-    on ``preset`` alone, and ``high`` competes a second, class-weight-balanced
-    stack-mean instead of an ExtraTrees level-2 head.
+    A ``low``/``medium``/``high`` preset axis composes the stack, and the serving
+    decision is a lookup on ``(preset, eval_metric)`` rather than on ``preset``
+    alone; ``high`` competes a second, class-weight-balanced stack-mean.
 
     ============ ============================ ========================= ==================================
     preset       level 0 (base heads)         level 1 (stackers)        level 2 (served)
@@ -2530,15 +1991,48 @@ class TSCGlueEnhancedV2(TSCGlueETAll):
     the average). Both are scored and reported in ``summary()``; which one is
     *served* comes from the table above.
 
-    ``probability-et-l2-all`` is never served by any pair, and — since
-    :meth:`TSCGlueET._select_best_model` is the only thing that fits it — never
-    trained. Everything falls back to MRHydraET when the stack cannot be built.
+    Everything falls back to MRHydraET when the stack cannot be built.
+
+    ``hydra`` is computed on the GPU when one is available. Its membership in
+    ``GPU_FEATURE_NAMES`` does two things at once: hydra is built with
+    ``self._device`` (so ``get_feature_transformer`` returns
+    :class:`~tscglue.features_gpu.HydraTransformerDevice` rather than aeon's
+    ``HydraTransformer``), and it is queued in the background device lane instead of
+    the main-thread cpu lane. It is listed *first*, so on the presets that also use
+    the foundation models it runs and releases its device memory before they
+    allocate -- and its cost comes off the cpu lane, which is the critical path
+    there (weasel and rdst dominate it).
+
+    With ``n_gpus=0`` none of that applies: ``_feature_device`` returns ``"cpu"``,
+    so hydra is aeon's transformer in the cpu lane. With a GPU the kernels are the
+    same -- drawn on the cpu from the same ``random_state`` -- but the arithmetic
+    runs in float32 on the device. Deviation is ~1e-6 relative for the features
+    themselves, except that hydra picks a winning kernel with ``max`` and
+    scatter-adds into its bucket, so two kernels within float32 epsilon can swap and
+    move a whole count. Compare accuracy distributions across devices, never exact
+    outputs (``notebooks/hydra_cpu_vs_gpu.ipynb`` measures both effects).
     """
 
-    BALANCED_MEAN_STACKER_NAME = "probability-stack-mean-balanced"
+    # hydra leads: cheap enough to release its device memory before the foundation
+    # models allocate.
+    GPU_FEATURE_NAMES = ("hydra", "mantis", "chronos2")
 
-    # Both ridges are excluded from whichever mean they belong to; the pool
+    # Never consulted -- __init__ always passes an explicit model_names for the
+    # chosen preset -- but kept honest: this is what the default preset builds.
+    DEFAULT_MODEL_NAMES = list(_ENHANCED_MEDIUM_MODELS)
+
+    # RSTSF is split into a feature-extraction transformer (RandomIntervals over 4
+    # series representations) plus a separately trained ExtraTreesClassifier, so no
+    # model takes raw series: everything goes through the feature-caching pipeline.
+    SERIES_MODELS = []
+    NO_SUBPROCESS_FEATURES: set[str] = {"multirocket", "rdst", "rstsf-random"}
+
+    # Virtual candidates averaging the stackers' probabilities. Ridge is excluded
+    # from whichever mean it belongs to because its decision-function
+    # pseudo-probabilities are uncalibrated and would poison the average; the pool
     # passed to _mean_members decides which of the two means is being built.
+    MEAN_STACKER_NAME = "probability-stack-mean"
+    BALANCED_MEAN_STACKER_NAME = "probability-stack-mean-balanced"
     MEAN_STACKER_EXCLUDE = ("probability-ridgecv", "probability-ridgecv-balanced")
 
     def __init__(
@@ -2567,18 +2061,15 @@ class TSCGlueEnhancedV2(TSCGlueETAll):
             model_names = list(_ENHANCED_LOW_MODELS)
             # Only one stacker is trained here, so the served head has to be
             # known pre-fit rather than picked from fitted candidates.
-            stacking_models = [_ENHANCED_V2_SERVED_HEAD[(preset, eval_metric)]]
+            stacking_models = [_ENHANCED_SERVED_HEAD[(preset, eval_metric)]]
         elif preset == "medium":
-            model_names = list(TSCGlueWeaselV2.DEFAULT_MODEL_NAMES)
-            stacking_models = list(_ENHANCED_V2_PLAIN_STACKERS)
+            model_names = list(_ENHANCED_MEDIUM_MODELS)
+            stacking_models = list(_ENHANCED_PLAIN_STACKERS)
         else:  # high
-            model_names = list(TSCGlueDual.DEFAULT_MODEL_NAMES)
-            stacking_models = list(_ENHANCED_V2_HIGH_STACKERS)
+            model_names = list(_ENHANCED_HIGH_MODELS)
+            stacking_models = list(_ENHANCED_HIGH_STACKERS)
 
-        # Skips the intermediate __init__s (they hardcode the pool/stackers this
-        # preset logic replaces), matching how TSCGlueEnhanced initialises.
-        LokyStackerV10RSTSFRandom.__init__(
-            self,
+        super().__init__(
             random_state=random_state,
             n_repetitions=n_repetitions,
             k_folds=k_folds,
@@ -2593,6 +2084,43 @@ class TSCGlueEnhancedV2(TSCGlueETAll):
             compute_dtype=compute_dtype,
         )
 
+    @staticmethod
+    def _brier(proba, y_true, classes) -> float:
+        """Multiclass Brier score.
+
+        OOF accuracy is a 0/1 count statistic and too noisy to rank stackers on
+        small datasets. Brier is smooth and bounded, so tree stackers emitting
+        exact-0 probabilities aren't catastrophically punished the way log-loss
+        would punish them.
+        """
+        onehot = (
+            np.asarray(y_true, dtype=str)[:, None] == np.asarray(classes, dtype=str)[None, :]
+        ).astype(np.float64)
+        return float(np.mean(np.sum((proba - onehot) ** 2, axis=1)))
+
+    def _oof_brier_score(self, y, model_name) -> float:
+        prob_array, _level, classes = self._load_model_predictions(model_name)
+        valid = ~np.isnan(prob_array).any(axis=1)
+        if not np.any(valid):
+            return float("inf")
+        return self._brier(prob_array[valid], y[valid], classes)
+
+    def _oof_mean_brier_score(self, y, members) -> float:
+        arrays, classes_ref = [], None
+        valid = np.ones(len(y), dtype=bool)
+        for name in members:
+            prob_array, _level, classes = self._load_model_predictions(name)
+            if classes_ref is None:
+                classes_ref = classes
+            elif classes != classes_ref:
+                raise ValueError(f"Stacker class orderings differ: {classes} vs {classes_ref}")
+            valid &= ~np.isnan(prob_array).any(axis=1)
+            arrays.append(prob_array)
+        if not np.any(valid):
+            return float("inf")
+        mean_proba = np.mean([a[valid] for a in arrays], axis=0)
+        return self._brier(mean_proba, y[valid], classes_ref)
+
     def _mean_members(self, pool=None) -> list[str]:
         """Mean members of ``pool`` (default: every stacker), minus its ridge.
 
@@ -2606,9 +2134,9 @@ class TSCGlueEnhancedV2(TSCGlueETAll):
         """Mean candidate name -> the stackers it averages, for this preset."""
         if self.preset == "low":
             return {}
-        pools = {self.MEAN_STACKER_NAME: _ENHANCED_V2_PLAIN_STACKERS}
+        pools = {self.MEAN_STACKER_NAME: _ENHANCED_PLAIN_STACKERS}
         if self.preset == "high":
-            pools[self.BALANCED_MEAN_STACKER_NAME] = _ENHANCED_V2_BALANCED_STACKERS
+            pools[self.BALANCED_MEAN_STACKER_NAME] = _ENHANCED_BALANCED_STACKERS
         return {name: self._mean_members(pool) for name, pool in pools.items()}
 
     def _select_best_model(self):
@@ -2616,10 +2144,10 @@ class TSCGlueEnhancedV2(TSCGlueETAll):
             # One stacker, so there is nothing to select and no mean to build.
             # selection is None, so this keeps best_model = stacking_models[0]
             # from __init__ — the same head the table below resolves to.
-            LokyStackerV10Base._select_best_model(self)
+            super()._select_best_model()
         else:
             self._score_stack_candidates()
-        self.best_model = _ENHANCED_V2_SERVED_HEAD[(self.preset, self.eval_metric)]
+        self.best_model = _ENHANCED_SERVED_HEAD[(self.preset, self.eval_metric)]
         self.log(
             f"Serving {self.best_model} (preset={self.preset}, eval_metric={self.eval_metric})",
             level=1,
@@ -2629,9 +2157,7 @@ class TSCGlueEnhancedV2(TSCGlueETAll):
         """Append OOF Brier rows for every stacker and every competing mean.
 
         Diagnostics only — the served head comes from the (preset, eval_metric)
-        table, not from these scores. Deliberately does not call
-        ``TSCGlueET._select_best_model``, which would fit the unused level-2
-        ExtraTrees and then serve it regardless of ``best_model``.
+        table, not from these scores.
         """
         y = read_array("y", str(self._require_tmpdir()))
         brier_scores = {name: self._oof_brier_score(y, name) for name in self.stacking_models}
@@ -2667,38 +2193,6 @@ class TSCGlueEnhancedV2(TSCGlueETAll):
         fallback.fit(X, y)
         save_model(fallback, "fallback", str(self._model_dir))
         self.log("Fallback model trained successfully", level=1, start_time=fit_start_time)
-
-
-class TSCGlueEnhancedV3(TSCGlueEnhancedV2):
-    """TSCGlueEnhancedV2 with hydra computed on the GPU.
-
-    The only difference from V2. Presets, stacker pools, served-head table, Brier
-    diagnostics and the MRHydraET fallback are all inherited untouched, so the two are
-    directly comparable.
-
-    Adding ``hydra`` to ``GPU_FEATURE_NAMES`` does two things at once: hydra is built
-    with ``self._device`` (so ``get_feature_transformer`` returns
-    :class:`~tscglue.features_gpu.HydraTransformerDevice` rather than aeon's
-    ``HydraTransformer``), and it is queued in the background device lane instead of
-    the main-thread cpu lane. It is listed *first*, so on the presets that also use the
-    foundation models it runs and releases its device memory before they allocate --
-    and its cost comes off the cpu lane, which is the critical path there (weasel and
-    rdst dominate it).
-
-    Two consequences worth knowing:
-
-    * **With ``n_gpus=0`` this is exactly V2.** ``_feature_device`` returns ``"cpu"``,
-      so hydra is aeon's transformer in the cpu lane, as before.
-    * **With a GPU it is not bit-identical to V2.** The kernels are the same -- they are
-      drawn on the cpu from the same ``random_state`` -- but the arithmetic runs in
-      float32 on the device. Deviation is ~1e-6 relative for the features themselves,
-      except that hydra picks a winning kernel with ``max`` and scatter-adds into its
-      bucket, so two kernels within float32 epsilon can swap and move a whole count.
-      Compare accuracy distributions against V2, never exact outputs
-      (``notebooks/hydra_cpu_vs_gpu.ipynb`` measures both effects).
-    """
-
-    GPU_FEATURE_NAMES = ("hydra", "mantis", "chronos2")
 
 
 class TSCGlueEnhancedV4(TSCGlueEnhancedV3):
@@ -2765,63 +2259,13 @@ class TSCGlueEnhancedV4(TSCGlueEnhancedV3):
         self.prune_constant = prune_constant
 
 
-class TSCGlueLogisticClassifier(LokyStackerV10RSTSFRandom):
-    STACKING_MODEL = "probability-logisticcv"
+class TSCGlueClassifier(TSCGlueEnhancedV4):
+    """The recommended TSCGlue stack: currently :class:`TSCGlueEnhancedV4`.
 
-    def __init__(
-        self,
-        random_state=None,
-        k_folds=10,
-        n_jobs=1,
-        verbose=0,
-        n_repetitions=1,
-        n_gpus=0,
-        runs_dir=None,
-        eval_metric="accuracy",
-    ):
-        assert n_gpus in (0, 1, -1), f"n_gpus must be 0, 1, or -1; got {n_gpus}"
-        assert eval_metric in _VALID_EVAL_METRICS, f"eval_metric must be one of {_VALID_EVAL_METRICS}; got {eval_metric!r}"
-        super().__init__(
-            random_state=random_state,
-            n_repetitions=n_repetitions,
-            k_folds=k_folds,
-            n_jobs=n_jobs,
-            keep_features=False,
-            verbose=verbose,
-            n_gpus=n_gpus,
-            runs_dir=runs_dir,
-            stacking_models=["probability-logisticcv"],
-            eval_metric=eval_metric,
-        )
-
-
-class TSCAGGlueClassifier(LokyStackerV10RSTSFRandom):
-    def __init__(
-        self,
-        random_state=None,
-        k_folds=10,
-        n_jobs=1,
-        verbose=0,
-        n_repetitions=1,
-        n_gpus=0,
-        runs_dir=None,
-        ag_preset="medium_quality",
-        ag_time_limit=60,
-    ):
-        assert n_gpus in (0, 1, -1), f"n_gpus must be 0, 1, or -1; got {n_gpus}"
-        super().__init__(
-            random_state=random_state,
-            n_repetitions=n_repetitions,
-            k_folds=k_folds,
-            n_jobs=n_jobs,
-            keep_features=False,
-            verbose=verbose,
-            n_gpus=n_gpus,
-            runs_dir=runs_dir,
-            stacking_models=["probability-autogluon"],
-            ag_preset=ag_preset,
-            ag_time_limit=ag_time_limit,
-        )
+    A stable name for whichever version is current, so callers do not have to
+    track the V-number. Everything -- presets, stacker pools, served-head table,
+    GPU hydra, constant-column pruning -- is inherited from V4 untouched.
+    """
 
 
 class AutoSelectKBestRegressor(BaseEstimator, RegressorMixin):

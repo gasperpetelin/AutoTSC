@@ -1,4 +1,4 @@
-"""Tests for TSCGlueClassifier, TSCGlueRegressor, and LokyStackerV10Base."""
+"""Tests for TSCGlueClassifier and TSCGlueRegressor."""
 
 import tempfile
 
@@ -8,12 +8,7 @@ from sklearn.metrics import accuracy_score
 
 from tscglue import utils
 from tscglue.models import (
-    LokyStackerV10Base,
-    TSCAGGlueClassifier,
     TSCGlueClassifier,
-    TSCGlueDual,
-    TSCGlueEnhancedV2,
-    TSCGlueEnhancedV3,
     TSCGlueRegressor,
     get_feature_transformer,
 )
@@ -24,19 +19,6 @@ def test_model_accuracy_on_coffee():
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         model = TSCGlueClassifier(random_state=270, n_repetitions=1, k_folds=10, runs_dir=tmp_dir)
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-
-    accuracy = accuracy_score(y_test, y_pred)
-    assert accuracy > 0.1, f"Accuracy {accuracy} is too low (<=0.1)"
-    assert accuracy <= 1.0, f"Accuracy {accuracy} is invalid (>1.0)"
-
-
-def test_ag_stacking_on_coffee():
-    X_train, y_train, X_test, y_test = utils.load_dataset("Coffee")
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        model = TSCAGGlueClassifier(random_state=270, n_repetitions=1, k_folds=10, runs_dir=tmp_dir)
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
 
@@ -89,15 +71,20 @@ def test_classifier_eval_metrics_multiclass(eval_metric):
 
 
 @pytest.mark.parametrize("compute_dtype", [None, "float32", "float64"])
-def test_v10base_compute_dtype(compute_dtype):
-    """Test that LokyStackerV10Base fit+predict works with different compute_dtype values."""
+def test_compute_dtype(compute_dtype):
+    """fit+predict works with each compute_dtype; None adopts X's own dtype.
+
+    `low` keeps this to the four cheap representations -- the dtype plumbing is
+    shared by every preset, so there is nothing extra to learn from a wider pool.
+    """
     X_train, y_train, X_test, y_test = utils.load_dataset("Coffee")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        model = LokyStackerV10Base(
+        model = TSCGlueClassifier(
             random_state=270,
             n_repetitions=1,
             k_folds=10,
+            preset="low",
             compute_dtype=compute_dtype,
             runs_dir=tmp_dir,
         )
@@ -157,10 +144,10 @@ def test_label_dtype(encode_labels):
     assert accuracy <= 1.0, f"Accuracy {accuracy} is invalid (>1.0)"
 
 
-def test_dual_shares_feature_specs():
+def test_high_preset_shares_feature_specs():
     """Both heads of each representation must reuse the identical cached feature (same seed)."""
     with tempfile.TemporaryDirectory() as tmp_dir:
-        model = TSCGlueDual(random_state=0, runs_dir=tmp_dir)
+        model = TSCGlueClassifier(random_state=0, preset="high", runs_dir=tmp_dir)
 
     assert len(model.model_specs) == 12
     # 12 models but only 8 transforms: multirocket, hydra, quant, rdst,
@@ -181,13 +168,13 @@ def test_dual_shares_feature_specs():
         assert ridge_ids == etc_ids, f"{ridge_name} and {etc_name} do not share features"
 
 
-def test_dual_fit_predict():
+def test_high_preset_fit_predict():
     X_train, y_train = _make_classification_data(seed=0)
     X_test, _ = _make_classification_data(seed=1)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        model = TSCGlueDual(
-            random_state=0, n_repetitions=1, k_folds=3, n_jobs=2, runs_dir=tmp_dir
+        model = TSCGlueClassifier(
+            random_state=0, n_repetitions=1, k_folds=3, n_jobs=2, preset="high", runs_dir=tmp_dir
         )
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
@@ -200,10 +187,40 @@ def test_dual_fit_predict():
     np.testing.assert_allclose(proba.sum(axis=1), 1.0, atol=1e-6)
 
 
+@pytest.mark.parametrize(
+    ("eval_metric", "expected_head"),
+    [("accuracy", "probability-ridgecv"), ("log_loss", "probability-et")],
+)
+def test_low_preset_serves_its_single_stacker(eval_metric, expected_head):
+    """`low` trains exactly one stacker, picked pre-fit by eval_metric, and serves it."""
+    X_train, y_train = _make_classification_data(n_per_class=6, n_classes=3, seed=0)
+    X_test, _ = _make_classification_data(n_per_class=2, n_classes=3, seed=1)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        model = TSCGlueClassifier(
+            random_state=0,
+            k_folds=3,
+            n_jobs=2,
+            preset="low",
+            eval_metric=eval_metric,
+            runs_dir=tmp_dir,
+        )
+        assert model.stacking_models == [expected_head]
+        # low drops fm, so no foundation-model features are built.
+        assert len(model.model_specs) == 4
+
+        model.fit(X_train, y_train)
+        proba = model.predict_proba(X_test)
+
+    assert model.best_model == expected_head
+    assert proba.shape == (len(X_test), len(np.unique(y_train)))
+    assert np.isfinite(proba).all()
+
+
 def test_missing_classes_helper():
     """_missing_classes reports labels of y that a fitted model cannot predict."""
     with tempfile.TemporaryDirectory() as tmp_dir:
-        model = LokyStackerV10Base(random_state=0, runs_dir=tmp_dir)
+        model = TSCGlueClassifier(random_state=0, runs_dir=tmp_dir)
 
     model.classes_ = np.array(["a", "b", "c"])
     assert model._missing_classes(np.array(["a", "b", "c"])) == []
@@ -214,45 +231,6 @@ def test_missing_classes_helper():
     model.classes_ = np.array([0, 1, 2])
     assert model._missing_classes(np.array([0, 1, 2], dtype=np.int32)) == []
     assert model._missing_classes(np.array([0, 2])) == [1]
-
-
-class _PhantomClassStacker(LokyStackerV10Base):
-    """Stack whose ``classes_`` holds a label no fold model can ever be fitted on.
-
-    Stands in for a base model that comes back with a narrower ``classes_`` than
-    ``y`` — the condition the fallback guard exists for, which is otherwise hard
-    to provoke through stratified folds.
-    """
-
-    def _fit(self, X, y):
-        self.classes_ = np.append(self.classes_, "__phantom__")
-        self.n_classes_ = len(self.classes_)
-        return super()._fit(X, y)
-
-
-def test_fallback_when_model_misses_class():
-    X_train, y_train = _make_classification_data(n_per_class=6, n_classes=3, seed=0)
-    X_test, _ = _make_classification_data(n_per_class=2, n_classes=3, seed=1)
-    y_train = y_train.astype(str)
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        model = _PhantomClassStacker(
-            random_state=0,
-            k_folds=2,
-            n_jobs=2,
-            model_names=["quant-etc"],
-            runs_dir=tmp_dir,
-        )
-        model.fit(X_train, y_train)
-
-        assert model._fallback_path.exists(), "Incomplete classes_ did not trigger the fallback"
-        # No stack was built, so nothing was scored or selected.
-        assert model.summary() == []
-
-        y_pred = model.predict(X_test)
-
-    assert y_pred.shape == (len(X_test),)
-    assert set(np.unique(y_pred)).issubset(set(np.unique(y_train)))
 
 
 def test_hydra_transformer_is_device_routed():
@@ -275,40 +253,36 @@ def _lane_names(model):
     return [ft.feature_name for ft in gpu_features], [ft.feature_name for ft in cpu_features]
 
 
-def test_enhanced_v3_puts_hydra_on_the_gpu_first():
-    """V3 moves hydra into the device lane, ahead of the foundation models."""
+def test_hydra_goes_on_the_gpu_lane_first():
+    """With a GPU, hydra joins the device lane ahead of the foundation models."""
     with tempfile.TemporaryDirectory() as tmp_dir:
-        v3 = TSCGlueEnhancedV3(random_state=0, n_gpus=1, preset="high", runs_dir=tmp_dir)
-        v2 = TSCGlueEnhancedV2(random_state=0, n_gpus=1, preset="high", runs_dir=tmp_dir)
+        model = TSCGlueClassifier(random_state=0, n_gpus=1, preset="high", runs_dir=tmp_dir)
 
-        v3_gpu, v3_cpu = _lane_names(v3)
-        v2_gpu, v2_cpu = _lane_names(v2)
+        gpu_lane, cpu_lane = _lane_names(model)
 
-        assert v3_gpu == ["hydra", "mantis", "chronos2"]
-        assert "hydra" not in v3_cpu
-        assert v3._feature_device("hydra") == "cuda"
+        # hydra leads, so it releases its device memory before mantis/chronos2 allocate.
+        assert gpu_lane == ["hydra", "mantis", "chronos2"]
+        assert "hydra" not in cpu_lane
+        assert model._feature_device("hydra") == "cuda"
 
-        # V2 is untouched: hydra stays on the cpu lane and is built for the cpu.
-        assert v2_gpu == ["mantis", "chronos2"]
-        assert "hydra" in v2_cpu
-        assert v2._feature_device("hydra") == "cpu"
-
-        # Only hydra moves -- every other feature is still built for the cpu.
-        assert v3._feature_device("quant") == "cpu"
-        assert v3._feature_device("multirocket") == "cpu"
-        assert v3._feature_device("mantis") == "cuda"
+        # Only GPU_FEATURE_NAMES move -- every other feature is still built for the cpu.
+        assert model._feature_device("quant") == "cpu"
+        assert model._feature_device("multirocket") == "cpu"
+        assert model._feature_device("rdst") == "cpu"
+        assert model._feature_device("mantis") == "cuda"
 
 
-def test_enhanced_v3_without_gpu_matches_v2():
-    """n_gpus=0 makes V3 exactly V2: no device lane, hydra built for the cpu."""
+def test_no_device_lane_without_a_gpu():
+    """n_gpus=0 empties the device lane: every feature is built for the cpu."""
     with tempfile.TemporaryDirectory() as tmp_dir:
-        v3 = TSCGlueEnhancedV3(random_state=0, n_gpus=0, preset="high", runs_dir=tmp_dir)
-        v2 = TSCGlueEnhancedV2(random_state=0, n_gpus=0, preset="high", runs_dir=tmp_dir)
+        model = TSCGlueClassifier(random_state=0, n_gpus=0, preset="high", runs_dir=tmp_dir)
 
-        assert _lane_names(v3) == _lane_names(v2)
-        assert _lane_names(v3)[0] == []
-        assert v3._feature_device("hydra") == "cpu"
-        assert v3._feature_device("mantis") == "cpu"
+        gpu_lane, cpu_lane = _lane_names(model)
+
+        assert gpu_lane == []
+        assert "hydra" in cpu_lane
+        for feature in ["hydra", "mantis", "chronos2", "quant", "multirocket"]:
+            assert model._feature_device(feature) == "cpu"
 
 
 def test_hydra_device_falls_back_to_cpu_without_cuda():
