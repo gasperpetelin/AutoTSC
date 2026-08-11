@@ -5,7 +5,7 @@
 from time import perf_counter
 
 import numpy as np
-from sklearn.base import BaseEstimator, ClassifierMixin, clone
+from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin, clone
 from sklearn.feature_selection import SelectKBest, VarianceThreshold, f_classif
 from sklearn.linear_model import RidgeClassifierCV
 from sklearn.pipeline import Pipeline
@@ -186,3 +186,29 @@ class AutoSelectKBestClassifier(BaseEstimator, ClassifierMixin):
         if not hasattr(inner, "predict_proba"):
             raise AttributeError("Underlying classifier does not support predict_proba().")
         return self.classifier_.predict_proba(X)
+
+
+class ClippedRegressor(BaseEstimator, RegressorMixin):
+    """Wrap a regressor and clip predictions to the training target range.
+
+    Lets a linear model (e.g. RidgeCV) keep its signal on ROCKET-style features
+    while preventing the rare p >> n fold from extrapolating off-scale, the way
+    tree models are bounded implicitly.
+    """
+
+    def __init__(self, regressor=None):
+        self.regressor = regressor
+
+    def fit(self, X, y):
+        self.regressor_ = clone(self.regressor)
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.regressor_.fit(X, y)
+        self.y_min_ = float(np.min(y))
+        self.y_max_ = float(np.max(y))
+        return self
+
+    def predict(self, X):
+        return np.clip(self.regressor_.predict(X), self.y_min_, self.y_max_)

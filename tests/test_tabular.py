@@ -1,9 +1,11 @@
 import numpy as np
 import pytest
 from sklearn.base import clone
+from sklearn.linear_model import RidgeCV
 
 from tscglue.tabular import (
     AutoSelectKBestClassifier,
+    ClippedRegressor,
     RidgeClassifierCVDecisionProba,
     RidgeClassifierCVIndicator,
 )
@@ -21,6 +23,13 @@ def _make_data(n_classes=2, n_per_class=25, n_features=12, seed=0, str_labels=Fa
     y = np.repeat(np.arange(n_classes), n_per_class)
     if str_labels:
         y = np.array([str(v) for v in y])
+    return X, y
+
+
+def _make_regression_data(n_samples=60, n_features=8, seed=0):
+    rng = np.random.default_rng(seed)
+    X = rng.standard_normal((n_samples, n_features))
+    y = X @ rng.standard_normal(n_features) + 0.1 * rng.standard_normal(n_samples)
     return X, y
 
 
@@ -73,4 +82,26 @@ def test_n_jobs_does_not_change_the_fitted_model(head, n_jobs):
     np.testing.assert_allclose(
         other.predict_proba(X), baseline.predict_proba(X), rtol=1e-8, atol=1e-10
     )
+
+
+def test_clipped_regressor_fits_and_predicts():
+    X, y = _make_regression_data()
+
+    reg = ClippedRegressor(regressor=RidgeCV()).fit(X, y)
+    pred = reg.predict(X)
+
+    assert pred.shape == (len(X),)
+    assert np.isfinite(pred).all()
+
+
+def test_clone_preserves_clipped_regressor_params():
+    reg = ClippedRegressor(regressor=RidgeCV(alphas=(0.5, 5.0)))
+
+    cloned = clone(reg)
+
+    # No get_params() equality here: clone deep-copies the wrapped estimator and
+    # sklearn estimators compare by identity, so the dicts never match.
+    assert isinstance(cloned.regressor, RidgeCV)
+    assert cloned.regressor.alphas == (0.5, 5.0)
+    assert cloned.regressor is not reg.regressor
 

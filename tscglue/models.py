@@ -36,6 +36,7 @@ from threadpoolctl import threadpool_limits
 from tscglue import utils
 from tscglue.tabular import (
     AutoSelectKBestClassifier,
+    ClippedRegressor,
     RidgeClassifierCVDecisionProba,
     RidgeClassifierCVIndicator,
 )
@@ -2846,32 +2847,6 @@ class AutoSelectKBestRegressor(BaseEstimator, RegressorMixin):
 
     def predict(self, X):
         return self.regressor_.predict(X)
-
-
-class ClippedRegressor(BaseEstimator, RegressorMixin):
-    """Wrap a regressor and clip predictions to the training target range.
-
-    Lets a linear model (e.g. RidgeCV) keep its signal on ROCKET-style features
-    while preventing the rare p >> n fold from extrapolating off-scale, the way
-    tree models are bounded implicitly.
-    """
-
-    def __init__(self, regressor=None):
-        self.regressor = regressor
-
-    def fit(self, X, y):
-        self.regressor_ = clone(self.regressor)
-        import warnings
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            self.regressor_.fit(X, y)
-        self.y_min_ = float(np.min(y))
-        self.y_max_ = float(np.max(y))
-        return self
-
-    def predict(self, X):
-        return np.clip(self.regressor_.predict(X), self.y_min_, self.y_max_)
 
 
 def get_model_reg(name, seed=None, n_jobs=1):
