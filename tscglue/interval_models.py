@@ -308,23 +308,6 @@ def _make_series_transforms(X):
     return transforms, series_transformers
 
 
-def _build_et(n_estimators, n_jobs, random_state):
-    return ExtraTreesClassifier(
-        n_estimators=n_estimators,
-        criterion="entropy",
-        class_weight="balanced",
-        max_features="sqrt",
-        n_jobs=n_jobs,
-        random_state=random_state,
-    )
-
-
-def _build_ridge():
-    from tscglue.tabular import RidgeClassifierCVDecisionProba
-
-    return RidgeClassifierCVDecisionProba(alphas=np.logspace(-3, 3, 10))
-
-
 class RSTSFRandomTransformer(BaseEstimator, TransformerMixin):
     """Feature extraction stage of RSTSFRandom, usable as a standalone transformer.
 

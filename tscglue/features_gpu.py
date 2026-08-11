@@ -214,15 +214,24 @@ class HydraTransformerDevice(BaseCollectionTransformer):
 
         W = self.W_.to(device=device, dtype=dtype)
         idx = [i.to(device) for i in self.idx_]
-        X = torch.as_tensor(np.asarray(X)).to(dtype)
+
+        # Batches are sliced, cast and moved one at a time, and written straight into a
+        # preallocated output: nothing the size of the whole collection is ever built,
+        # on the host or the device.
+        X = np.asarray(X)
+        n_features = 2 * len(self.dilations_) * self.divisor_ * self.h_ * self.n_kernels
+        Xt = torch.empty((len(X), n_features), dtype=dtype)
 
         with torch.no_grad():
-            Xt = torch.cat(
-                [
-                    self._forward(X[start : start + self.batch_size].to(device), W, idx).cpu()
-                    for start in range(0, len(X), self.batch_size)
-                ]
-            )
+            for start in range(0, len(X), self.batch_size):
+                chunk = X[start : start + self.batch_size]
+                if not chunk.flags.writeable:
+                    # np.load(mmap_mode="r") hands back a read-only array, which
+                    # torch.as_tensor only accepts with a warning.
+                    chunk = chunk.copy()
+                # Cast on the host before moving, so only ``dtype`` crosses the bus.
+                batch = torch.as_tensor(chunk).to(dtype).to(device)
+                Xt[start : start + len(batch)].copy_(self._forward(batch, W, idx))
 
         if self.output_type == "tensor":
             return Xt
