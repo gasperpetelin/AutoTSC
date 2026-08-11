@@ -7,7 +7,7 @@ from aeon.transformations.collection.convolution_based._hydra import HydraTransf
 from aeon.transformations.collection.interval_based import QUANTTransformer
 
 from tscglue.interval_models import RSTSFRandomTransformer
-from tscglue.models import RDSTFloat64
+from tscglue.models import RDSTFloat64, WEASELTransformerV2Unsupervised
 from tscglue.models_tsfm import Chronos2Embedding, MantisEmbedding
 
 
@@ -58,6 +58,17 @@ def test_fm_multivariate_channel_scaling(make_transformer):
     Xt_multi = make_transformer().fit(X).transform(X)
     _check(Xt_multi, X.shape[0])
     assert Xt_multi.shape[1] == n_channels * Xt_uni.shape[1]
+
+
+def test_weasel_multivariate():
+    X = _X(n_samples=10, n_channels=3, n_timepoints=16)
+    transformer = WEASELTransformerV2Unsupervised(
+        word_lengths=(4,), use_first_differences=(False,), n_jobs=1
+    )
+    Xt = transformer.fit_transform(X)
+
+    assert Xt.shape[0] == len(X)
+    assert transformer.transform(X).shape == Xt.shape
 
 
 def test_rstsf_random_modes_match():

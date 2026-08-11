@@ -382,10 +382,53 @@ class WEASELTransformerV2Unsupervised(WEASELTransformerV2):
     def fit_transform(self, X, y=None):
         if y is None:
             y = np.zeros(X.shape[0], dtype=int)
-        return super().fit_transform(X, y)
+
+        self.transformers_ = []
+        Xt = []
+        for channel in range(X.shape[1]):
+            transformer = WEASELTransformerV2(
+                min_window=self.min_window,
+                norm_options=self.norm_options,
+                word_lengths=self.word_lengths,
+                use_first_differences=self.use_first_differences,
+                feature_selection="none",
+                max_feature_count=self.max_feature_count,
+                random_state=self.random_state,
+                n_jobs=self.n_jobs,
+            )
+            Xt.append(transformer.fit_transform(X[:, channel : channel + 1], y))
+            self.transformers_.append(transformer)
+        return np.hstack(Xt)
+
+    def transform(self, X, y=None):
+        if X.shape[1] != len(self.transformers_):
+            raise ValueError("X must have the same number of channels as the training data")
+        return np.hstack(
+            [
+                transformer.transform(X[:, channel : channel + 1])
+                for channel, transformer in enumerate(self.transformers_)
+            ]
+        )
 
     def _transform(self, X, y=None):
         return super()._transform(np.asarray(X, dtype=np.float64), y)
+
+
+#: Feature transformers that honour the ``device`` argument of
+#: :func:`get_feature_transformer`. Every other name builds a cpu transformer and
+#: ignores ``device``. This is a capability of the transformer, not a policy: which
+#: of these an estimator actually puts on a GPU is its ``GPU_FEATURE_NAMES``, which
+#: must be a subset of this set.
+GPU_CAPABLE_FEATURES: frozenset[str] = frozenset({"hydra", "mantis", "chronos2"})
+
+
+def supports_gpu(feature_type: str) -> bool:
+    """Whether ``feature_type`` can be built for a non-cpu device.
+
+    Unknown names are reported as cpu-only rather than raising; only
+    :func:`get_feature_transformer` validates the name.
+    """
+    return feature_type in GPU_CAPABLE_FEATURES
 
 
 def get_feature_transformer(feature_type: str, seed: int, n_jobs: int = 1, device: str = "cpu"):
@@ -649,7 +692,9 @@ class LokyStackerV10Base(BaseClassifier):
     STACKING_MODEL = "probability-ridgecv"
     # Features computed on the GPU when one is available. Membership decides both which
     # features are queued in the background device lane and which are built with
-    # ``self._device``; the order is the order the lane runs them in.
+    # ``self._device``; the order is the order the lane runs them in. A subset of
+    # ``GPU_CAPABLE_FEATURES`` -- naming a cpu-only feature here would queue it in the
+    # device lane and gain nothing, since its transformer ignores ``device``.
     GPU_FEATURE_NAMES: tuple[str, ...] = ("mantis", "chronos2")
     NO_SUBPROCESS_FEATURES: set[str] = {"multirocket", "rdst"}
     # Class-level default so every estimator has the attribute; ``TSCGlueEnhancedV4``
@@ -3067,5 +3112,3 @@ class DictMultiScaler(BaseEstimator, TransformerMixin):
 
     def fit_transform(self, X: dict[str, np.ndarray], y=None, idx=None):
         return self.fit(X, y, idx=idx).transform(X, idx=idx)
-
-
