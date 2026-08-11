@@ -23,11 +23,11 @@ from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.preprocessing import StandardScaler
 
 from tscglue.models import (
-    AutoSelectKBestClassifier,
     RareClassSafeLogisticCV,
     SparseScaler,
     get_feature_transformer,
 )
+from tscglue.tabular import AutoSelectKBestClassifier
 
 
 class TSCFeatureBaseline(BaseClassifier):

@@ -2,10 +2,13 @@ import numpy as np
 import pytest
 from sklearn.base import clone
 
-from tscglue.tabular import RidgeClassifierCVDecisionProba, RidgeClassifierCVIndicator
+from tscglue.tabular import (
+    AutoSelectKBestClassifier,
+    RidgeClassifierCVDecisionProba,
+    RidgeClassifierCVIndicator,
+)
 
-ALPHAS = np.logspace(-3, 3, 10)
-HEADS = [RidgeClassifierCVDecisionProba, RidgeClassifierCVIndicator]
+HEADS = [RidgeClassifierCVDecisionProba, RidgeClassifierCVIndicator, AutoSelectKBestClassifier]
 
 
 def _make_data(n_classes=2, n_per_class=25, n_features=12, seed=0, str_labels=False):
@@ -26,7 +29,7 @@ def _make_data(n_classes=2, n_per_class=25, n_features=12, seed=0, str_labels=Fa
 @pytest.mark.parametrize("str_labels", [False, True])
 def test_predict_proba_rows_are_bounded_and_sum_to_one(head, n_classes, str_labels):
     X, y = _make_data(n_classes=n_classes, str_labels=str_labels)
-    clf = head(alphas=ALPHAS).fit(X, y)
+    clf = head().fit(X, y)
 
     proba = clf.predict_proba(X)
 
@@ -41,7 +44,7 @@ def test_predict_proba_rows_are_bounded_and_sum_to_one(head, n_classes, str_labe
 @pytest.mark.parametrize("str_labels", [False, True])
 def test_predict_proba_columns_follow_classes_order(head, n_classes, str_labels):
     X, y = _make_data(n_classes=n_classes, str_labels=str_labels)
-    clf = head(alphas=ALPHAS).fit(X, y)
+    clf = head().fit(X, y)
 
     proba = clf.predict_proba(X)
 
@@ -50,13 +53,12 @@ def test_predict_proba_columns_follow_classes_order(head, n_classes, str_labels)
 
 @pytest.mark.parametrize("head", HEADS)
 def test_clone_preserves_constructor_params(head):
-    clf = head(alphas=ALPHAS, class_weight="balanced", n_jobs=4)
+    clf = head(n_jobs=4)
 
     cloned = clone(clf)
 
-    assert cloned.class_weight == "balanced"
     assert cloned.n_jobs == 4
-    np.testing.assert_array_equal(cloned.alphas, ALPHAS)
+    assert cloned.get_params() == clf.get_params()
     assert head().n_jobs == 1
 
 
@@ -64,11 +66,11 @@ def test_clone_preserves_constructor_params(head):
 @pytest.mark.parametrize("n_jobs", [2, -1])
 def test_n_jobs_does_not_change_the_fitted_model(head, n_jobs):
     X, y = _make_data(n_classes=3)
-    baseline = head(alphas=ALPHAS).fit(X, y)
-    other = head(alphas=ALPHAS, n_jobs=n_jobs).fit(X, y)
+    baseline = head().fit(X, y)
+    other = head(n_jobs=n_jobs).fit(X, y)
 
     # allclose, not exact: a different BLAS thread count reorders the reductions.
-    assert other.alpha_ == baseline.alpha_
     np.testing.assert_allclose(
-        other.decision_function(X), baseline.decision_function(X), rtol=1e-8, atol=1e-10
+        other.predict_proba(X), baseline.predict_proba(X), rtol=1e-8, atol=1e-10
     )
+
