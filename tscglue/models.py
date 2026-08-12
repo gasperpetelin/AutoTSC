@@ -22,7 +22,7 @@ from aeon.transformations.collection.interval_based import QUANTTransformer
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
 from sklearn.feature_selection import VarianceThreshold, chi2
-from sklearn.metrics import accuracy_score, r2_score
+from sklearn.metrics import r2_score
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -49,6 +49,7 @@ from tscglue.utils import (
     read_model,
     save_array,
     save_model,
+    score_predictions,
 )
 from tscglue.weasel_features import WEASELTransformerV2Unsupervised
 
@@ -729,47 +730,14 @@ class LokyStackerV10Base(BaseClassifier):
         return prob_array, level, classes
 
     def _compute_oof_score(self, y, model_name) -> float:
+        """Score a model's cached OOF predictions, skipping rows it never predicted."""
         prob_array, _level, classes = self._load_model_predictions(model_name)
         valid = ~np.isnan(prob_array).any(axis=1)
         if not np.any(valid):
             return 0.0
-        y_true = y[np.where(valid)[0]]
-        proba = prob_array[valid]
-
-        if self.eval_metric == "accuracy":
-            pred_idx = np.argmax(proba, axis=1)
-            preds = np.asarray(classes)[pred_idx]
-            return float(accuracy_score(np.asarray(y_true, dtype=str), np.asarray(preds, dtype=str)))
-        elif self.eval_metric == "f1":
-            from sklearn.metrics import f1_score
-            pred_idx = np.argmax(proba, axis=1)
-            preds = np.asarray(classes)[pred_idx]
-            # Macro so every class weighs equally, matching the ovr/macro
-            # convention already used for roc_auc and average_precision here.
-            return float(
-                f1_score(
-                    np.asarray(y_true, dtype=str),
-                    np.asarray(preds, dtype=str),
-                    average="macro",
-                )
-            )
-        elif self.eval_metric == "log_loss":
-            from sklearn.metrics import log_loss
-            return float(log_loss(y_true, proba, labels=classes))
-        elif self.eval_metric == "roc_auc":
-            from sklearn.metrics import roc_auc_score
-            if len(classes) == 2:
-                return float(roc_auc_score(y_true, proba[:, 1]))
-            return float(roc_auc_score(y_true, proba, multi_class="ovr", labels=classes))
-        elif self.eval_metric == "average_precision":
-            from sklearn.metrics import average_precision_score
-            from sklearn.preprocessing import label_binarize
-            if len(classes) == 2:
-                return float(average_precision_score(y_true, proba[:, 1]))
-            y_bin = label_binarize(y_true, classes=classes)
-            return float(average_precision_score(y_bin, proba, average="macro"))
-        else:
-            raise ValueError(f"Unknown eval_metric: {self.eval_metric!r}")
+        return score_predictions(
+            y[np.where(valid)[0]], prob_array[valid], classes, self.eval_metric
+        )
 
     def _build_probability_array(self, n_samples: int):
         d = self._require_tmpdir()

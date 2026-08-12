@@ -9,9 +9,20 @@ import numpy as np
 import polars as pl
 from aeon.datasets import load_classification, load_from_ts_file
 from huggingface_hub import hf_hub_download
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    f1_score,
+    log_loss,
+    roc_auc_score,
+)
 from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.preprocessing import label_binarize
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
+
+#: Metrics :func:`score_predictions` accepts. All but ``log_loss`` are higher-is-better.
+EVAL_METRICS = ("accuracy", "f1", "log_loss", "roc_auc", "average_precision")
 
 
 def log(message: str, level: int, verbose: int, start_time=None, current_time=None):
@@ -22,6 +33,40 @@ def log(message: str, level: int, verbose: int, start_time=None, current_time=No
             print(f"[{current_time - start_time:.2f}s] {message}")
         else:
             print(message)
+
+
+def score_predictions(y_true, proba, classes, metric: str) -> float:
+    """Score probability predictions against ``y_true``.
+
+    ``proba`` has one column per entry of ``classes``, in that order. Label-based
+    metrics take the argmax and compare as strings so mixed label dtypes still match.
+    Multiclass ``roc_auc`` and ``average_precision`` are macro-averaged one-vs-rest.
+    """
+    if metric == "accuracy":
+        preds = np.asarray(classes)[np.argmax(proba, axis=1)]
+        return float(accuracy_score(np.asarray(y_true, dtype=str), np.asarray(preds, dtype=str)))
+    if metric == "f1":
+        preds = np.asarray(classes)[np.argmax(proba, axis=1)]
+        return float(
+            f1_score(
+                np.asarray(y_true, dtype=str),
+                np.asarray(preds, dtype=str),
+                average="macro",
+            )
+        )
+    if metric == "log_loss":
+        return float(log_loss(y_true, proba, labels=classes))
+    if metric == "roc_auc":
+        if len(classes) == 2:
+            return float(roc_auc_score(y_true, proba[:, 1]))
+        return float(roc_auc_score(y_true, proba, multi_class="ovr", labels=classes))
+    if metric == "average_precision":
+        if len(classes) == 2:
+            return float(average_precision_score(y_true, proba[:, 1]))
+        return float(
+            average_precision_score(label_binarize(y_true, classes=classes), proba, average="macro")
+        )
+    raise ValueError(f"Unknown eval_metric: {metric!r}")
 
 
 def save_array(X, name, directory, dtype=None, repetition=None):

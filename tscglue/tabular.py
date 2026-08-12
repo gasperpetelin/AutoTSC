@@ -215,6 +215,8 @@ class RareClassSafeLogisticCV(BaseEstimator, ClassifierMixin):
                 solver=self.solver,
                 max_iter=self.max_iter,
                 class_weight=self.class_weight,
+                l1_ratios=(0.0,),
+                use_legacy_attributes=False,
             )
         self.estimator_.fit(X, y)
         self.classes_ = self.estimator_.classes_
