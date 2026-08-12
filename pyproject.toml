@@ -15,7 +15,6 @@ dependencies = [
     "click",
     "pyarrow",
     "statsmodels",
-    "tabicl",
     "tsfresh",
     "catboost",
     "lightgbm",
@@ -54,9 +53,6 @@ dev = [
     "boto3",
     "awscli",
     "moto[s3]",
-]
-autogluon = [
-    "autogluon.tabular",
 ]
 
 [build-system]

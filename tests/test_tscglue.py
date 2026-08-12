@@ -1,5 +1,6 @@
 """Tests for TSCGlueClassifier and TSCGlueRegressor."""
 
+import dataclasses
 import tempfile
 
 import numpy as np
@@ -9,9 +10,9 @@ from sklearn.metrics import accuracy_score
 from tscglue import utils
 from tscglue.models import (
     TSCGlueClassifier,
-    TSCGlueRegressor,
     get_feature_transformer,
 )
+from tscglue.models_regressor import TSCGlueRegressor
 
 
 def test_model_accuracy_on_coffee():
@@ -257,6 +258,10 @@ def _lane_names(model):
     return [ft.feature_name for ft in gpu_features], [ft.feature_name for ft in cpu_features]
 
 
+def _spec(model, name):
+    return next(ft for ft in model.features_list if ft.feature_name == name)
+
+
 def test_hydra_goes_on_the_gpu_lane_first():
     """With a GPU, hydra joins the device lane ahead of the foundation models."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -267,13 +272,13 @@ def test_hydra_goes_on_the_gpu_lane_first():
         # hydra leads, so it releases its device memory before mantis/chronos2 allocate.
         assert gpu_lane == ["hydra", "mantis", "chronos2"]
         assert "hydra" not in cpu_lane
-        assert model._feature_device("hydra") == "cuda"
+        assert model._feature_device(_spec(model, "hydra")) == "cuda"
 
-        # Only GPU_FEATURE_NAMES move -- every other feature is still built for the cpu.
-        assert model._feature_device("quant") == "cpu"
-        assert model._feature_device("multirocket") == "cpu"
-        assert model._feature_device("rdst") == "cpu"
-        assert model._feature_device("mantis") == "cuda"
+        # Only support_gpu features move -- every other one is still built for the cpu.
+        assert model._feature_device(_spec(model, "quant")) == "cpu"
+        assert model._feature_device(_spec(model, "multirocket")) == "cpu"
+        assert model._feature_device(_spec(model, "rdst")) == "cpu"
+        assert model._feature_device(_spec(model, "mantis")) == "cuda"
 
 
 def test_no_device_lane_without_a_gpu():
@@ -286,7 +291,24 @@ def test_no_device_lane_without_a_gpu():
         assert gpu_lane == []
         assert "hydra" in cpu_lane
         for feature in ["hydra", "mantis", "chronos2", "quant", "multirocket"]:
-            assert model._feature_device(feature) == "cpu"
+            assert model._feature_device(_spec(model, feature)) == "cpu"
+
+
+def test_support_gpu_flag_steers_the_lane():
+    """The lane split follows FeatureSpec.support_gpu, nothing else."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        model = TSCGlueClassifier(random_state=0, n_gpus=1, preset="high", runs_dir=tmp_dir)
+
+        model.features_list = [
+            dataclasses.replace(ft, support_gpu=ft.feature_name == "quant")
+            for ft in model.features_list
+        ]
+
+        gpu_lane, cpu_lane = _lane_names(model)
+        assert gpu_lane == ["quant"]
+        assert "hydra" in cpu_lane
+        assert model._feature_device(_spec(model, "quant")) == "cuda"
+        assert model._feature_device(_spec(model, "hydra")) == "cpu"
 
 
 def test_hydra_device_falls_back_to_cpu_without_cuda():

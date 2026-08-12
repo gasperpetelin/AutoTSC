@@ -1,6 +1,9 @@
 """Utility functions for AutoTSC."""
 
+import multiprocessing
 import os
+import pickle
+from time import perf_counter
 
 import numpy as np
 import polars as pl
@@ -9,6 +12,72 @@ from huggingface_hub import hf_hub_download
 from sklearn.model_selection import KFold, StratifiedKFold
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
+
+
+def log(message: str, level: int, verbose: int, start_time=None, current_time=None):
+    if verbose >= level:
+        if start_time is not None:
+            if current_time is None:
+                current_time = perf_counter()
+            print(f"[{current_time - start_time:.2f}s] {message}")
+        else:
+            print(message)
+
+
+def save_array(X, name, directory, dtype=None, repetition=None):
+    if dtype is not None:
+        X = np.asarray(X, dtype=dtype)
+    suffix = f"_r_{repetition}" if repetition is not None else ""
+    path = f"{directory}/{name}{suffix}.npy"
+    np.save(path, X)
+    size = os.path.getsize(path) / (1024 * 1024)
+    return path, X.shape, size
+
+
+def read_array(name, directory, repetition=None, mmap_mode="r", allow_pickle=False):
+    suffix = f"_r_{repetition}" if repetition is not None else ""
+    path = f"{directory}/{name}{suffix}.npy"
+    # TODO remove allow_pickle=True once all features/models are numpy arrays
+    return np.load(path, mmap_mode=mmap_mode, allow_pickle=allow_pickle)
+
+
+def save_model(model, name, directory, repetition=None, fold=None):
+    rep_suffix = f"_r_{repetition}" if repetition is not None else ""
+    fold_suffix = f"_f_{fold}" if fold is not None else ""
+    path = f"{directory}/{name}{rep_suffix}{fold_suffix}.pkl"
+    os.makedirs(directory, exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(model, f)
+    size = os.path.getsize(path)
+    return path, size
+
+
+def read_model(name, directory, repetition=None, fold=None):
+    directory = str(directory)
+    rep_suffix = f"_r_{repetition}" if repetition is not None else ""
+    fold_suffix = f"_f_{fold}" if fold is not None else ""
+    path = f"{directory}/{name}{rep_suffix}{fold_suffix}.pkl"
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def _noop():
+    return None
+
+
+def _run_in_subprocess(target, args):
+    """Run target(*args) in a fresh spawned subprocess.
+
+    Uses 'spawn' context to avoid inheriting state (e.g. GPU memory, open file
+    descriptors, TensorFlow/PyTorch globals) from the parent process, which can
+    cause hangs or incorrect behaviour with foundation-model transformers.
+    """
+    mp_ctx = multiprocessing.get_context("forkserver")
+    p = mp_ctx.Process(target=target, args=args)
+    p.start()
+    p.join()
+    if p.exitcode != 0:
+        raise RuntimeError(f"Subprocess failed with exit code {p.exitcode}")
 
 
 def require_torch():
