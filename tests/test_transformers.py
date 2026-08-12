@@ -7,8 +7,9 @@ from aeon.transformations.collection.convolution_based._hydra import HydraTransf
 from aeon.transformations.collection.interval_based import QUANTTransformer
 
 from tscglue.interval_models import RSTSFRandomTransformer
-from tscglue.models import RDSTFloat64, WEASELTransformerV2Unsupervised
 from tscglue.models_tsfm import Chronos2Embedding, MantisEmbedding
+from tscglue.rdst_features import RDSTFloat64
+from tscglue.weasel_features import WEASELTransformerV2Unsupervised
 
 
 def _X(n_samples=20, n_channels=1, n_timepoints=64, seed=0):

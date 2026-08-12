@@ -15,24 +15,28 @@ import numpy as np
 import polars as pl
 from aeon.classification.base import BaseClassifier
 from aeon.classification.convolution_based import MultiRocketHydraClassifier
-from aeon.classification.dictionary_based._weasel_v2 import WEASELTransformerV2
 from aeon.transformations.collection.convolution_based import MultiRocket
 from aeon.transformations.collection.convolution_based._hydra import HydraTransformer
+from aeon.transformations.collection.feature_based import TSFresh
 from aeon.transformations.collection.interval_based import QUANTTransformer
-from aeon.transformations.collection.shapelet_based import RandomDilatedShapeletTransform
-from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
 from sklearn.feature_selection import VarianceThreshold, chi2
 from sklearn.metrics import accuracy_score, r2_score
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from threadpoolctl import threadpool_limits
 
 from tscglue import utils
+from tscglue.drcif_features import DrCIFExtractor
+from tscglue.features_gpu import HydraTransformerDevice
+from tscglue.interval_models import RSTSFRandomTransformer
+from tscglue.models_tsfm import Chronos2Embedding, MantisEmbedding
+from tscglue.rdst_features import RDSTFloat64
 from tscglue.tabular import (
     AutoSelectKBestClassifier,
     NoScaler,
+    RareClassSafeLogisticCV,
     RidgeClassifierCVDecisionProba,
     RidgeClassifierCVIndicator,
     SparseScaler,
@@ -46,85 +50,10 @@ from tscglue.utils import (
     save_array,
     save_model,
 )
+from tscglue.weasel_features import WEASELTransformerV2Unsupervised
 
 
-class RareClassSafeLogisticCV(BaseEstimator, ClassifierMixin):
-    """LogisticRegressionCV that won't crash on rare classes.
-
-    LogisticRegressionCV runs an internal stratified CV to choose C. When a class
-    has a single member in the data it is handed, one fold's training split omits
-    that class and the multinomial coefficient paths become ragged, so the
-    internal ``np.reshape`` raises "inhomogeneous shape". This wrapper drops the
-    internal CV (fixed-C ``LogisticRegression``) only in that singleton case and
-    is otherwise bit-identical to the original ``LogisticRegressionCV``.
-    """
-
-    def __init__(self, Cs=10, fixed_C=1.0, solver="lbfgs", max_iter=1000, class_weight=None):
-        self.Cs = Cs
-        self.fixed_C = fixed_C
-        self.solver = solver
-        self.max_iter = max_iter
-        self.class_weight = class_weight
-
-    def fit(self, X, y):
-        from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
-
-        min_count = int(np.unique(y, return_counts=True)[1].min())
-        if min_count < 2:
-            # A singleton class would make the internal CV crash; skip it.
-            self.estimator_ = LogisticRegression(
-                C=self.fixed_C,
-                solver=self.solver,
-                max_iter=self.max_iter,
-                class_weight=self.class_weight,
-            )
-        else:
-            # Identical to the original stacker: default cv=5, multinomial.
-            self.estimator_ = LogisticRegressionCV(
-                Cs=self.Cs,
-                solver=self.solver,
-                max_iter=self.max_iter,
-                class_weight=self.class_weight,
-            )
-        self.estimator_.fit(X, y)
-        self.classes_ = self.estimator_.classes_
-        return self
-
-    def predict(self, X):
-        return self.estimator_.predict(X)
-
-    def predict_proba(self, X):
-        return self.estimator_.predict_proba(X)
-
-
-class ThreadBudgetMLPClassifier(MLPClassifier):
-    def __init__(
-        self,
-        hidden_layer_sizes=(100,),
-        *,
-        max_iter=200,
-        random_state=None,
-        n_jobs=1,
-    ):
-        super().__init__(
-            hidden_layer_sizes=hidden_layer_sizes,
-            max_iter=max_iter,
-            random_state=random_state,
-        )
-        self.n_jobs = n_jobs
-
-    def fit(self, X, y):
-        with threadpool_limits(limits=None if self.n_jobs == -1 else self.n_jobs):
-            return super().fit(X, y)
-
-    def predict_proba(self, X):
-        with threadpool_limits(limits=None if self.n_jobs == -1 else self.n_jobs):
-            return super().predict_proba(X)
-
-
-# name -> (feature scalers, head factory). Scalers are stored as classes so each call
-# builds its own unfitted instance; every head takes **_ and names only what it uses.
-_MODELS_V6 = {
+MODELS_DICTIONARY = {
     "multirockethydra-ridgecv": (
         {"hydra": SparseScaler, "multirocket": StandardScaler},
         lambda **_: RidgeClassifierCVIndicator(alphas=np.logspace(-3, 3, 10)),
@@ -284,9 +213,9 @@ _MODELS_V6 = {
 
 def get_model_v6(name, seed=None, n_jobs=1, model_dir=None, prepruned_features=False, **kwargs):
     """Returns (DictMultiScaler, classifier) for feature and stacking models."""
-    if name not in _MODELS_V6:
+    if name not in MODELS_DICTIONARY:
         raise ValueError(f"Unknown model name: {name}")
-    scalers, head = _MODELS_V6[name]
+    scalers, head = MODELS_DICTIONARY[name]
     scaler = DictMultiScaler(scalers={feat: cls() for feat, cls in scalers.items()})
     clf = head(
         seed=seed,
@@ -296,77 +225,6 @@ def get_model_v6(name, seed=None, n_jobs=1, model_dir=None, prepruned_features=F
         **kwargs,
     )
     return scaler, clf
-
-
-class RDSTFloat64(RandomDilatedShapeletTransform):
-    """RDST wrapper that casts input to float64 (numba requires it)."""
-
-    def _fit(self, X, y=None):
-        return super()._fit(np.asarray(X, dtype=np.float64), y)
-
-
-class WEASELTransformerV2Unsupervised(WEASELTransformerV2):
-    """WEASELTransformerV2 usable in this project's unsupervised feature pipeline.
-
-    Upstream always does ``y.copy()`` in fit_transform, but feature_selection="none"
-    means y is otherwise unused, so a placeholder y stands in for the real labels
-    that the shared feature-fitting call sites don't have access to.
-    """
-
-    def __init__(
-        self,
-        min_window=4,
-        norm_options=(False,),
-        word_lengths=(7, 8),
-        use_first_differences=(True, False),
-        max_feature_count=30_000,
-        random_state=None,
-        n_jobs=4,
-    ):
-        super().__init__(
-            min_window=min_window,
-            norm_options=norm_options,
-            word_lengths=word_lengths,
-            use_first_differences=use_first_differences,
-            feature_selection="none",
-            max_feature_count=max_feature_count,
-            random_state=random_state,
-            n_jobs=n_jobs,
-        )
-
-    def fit_transform(self, X, y=None):
-        if y is None:
-            y = np.zeros(X.shape[0], dtype=int)
-
-        self.transformers_ = []
-        Xt = []
-        for channel in range(X.shape[1]):
-            transformer = WEASELTransformerV2(
-                min_window=self.min_window,
-                norm_options=self.norm_options,
-                word_lengths=self.word_lengths,
-                use_first_differences=self.use_first_differences,
-                feature_selection="none",
-                max_feature_count=self.max_feature_count,
-                random_state=self.random_state,
-                n_jobs=self.n_jobs,
-            )
-            Xt.append(transformer.fit_transform(X[:, channel : channel + 1], y))
-            self.transformers_.append(transformer)
-        return np.hstack(Xt)
-
-    def transform(self, X, y=None):
-        if X.shape[1] != len(self.transformers_):
-            raise ValueError("X must have the same number of channels as the training data")
-        return np.hstack(
-            [
-                transformer.transform(X[:, channel : channel + 1])
-                for channel, transformer in enumerate(self.transformers_)
-            ]
-        )
-
-    def _transform(self, X, y=None):
-        return super()._transform(np.asarray(X, dtype=np.float64), y)
 
 
 def get_feature_transformer(feature_type: str, seed: int, n_jobs: int = 1, device: str = "cpu"):
@@ -379,32 +237,19 @@ def get_feature_transformer(feature_type: str, seed: int, n_jobs: int = 1, devic
             return QUANTTransformer()
         case "hydra":
             if device != "cpu":
-                # Local import, as for the foundation models below: torch is only a
-                # hard dependency on the device path. HydraTransformerDevice takes no
-                # n_jobs -- the device path has no CPU work worth budgeting.
-                from tscglue.features_gpu import HydraTransformerDevice
-
+                # HydraTransformerDevice takes no n_jobs -- the device path has no CPU
+                # work worth budgeting.
                 return HydraTransformerDevice(random_state=seed, device=device)
             return HydraTransformer(n_jobs=n_jobs, random_state=seed)
         case "mantis":
-            from tscglue.models_tsfm import MantisEmbedding
-
             return MantisEmbedding(device=device)
         case "chronos2":
-            from tscglue.models_tsfm import Chronos2Embedding
-
             return Chronos2Embedding(device=device)
         case "tsfresh":
-            from aeon.transformations.collection.feature_based import TSFresh
-
             return TSFresh(default_fc_parameters="efficient", n_jobs=n_jobs)
         case "rstsf-random":
-            from tscglue.interval_models import RSTSFRandomTransformer
-
             return RSTSFRandomTransformer(n_jobs=n_jobs, random_state=seed)
         case "drcif":
-            from tscglue.drcif_features import DrCIFExtractor
-
             return DrCIFExtractor(random_state=seed, n_jobs=n_jobs)
         case "weasel":
             return WEASELTransformerV2Unsupervised(random_state=seed, n_jobs=n_jobs)
@@ -507,6 +352,19 @@ class FeatureSpec:
             else self.feature_name
         )
 
+    @staticmethod
+    def split_lanes(features) -> tuple[list["FeatureSpec"], list["FeatureSpec"]]:
+        """Split specs into (device lane, cpu lane) on ``support_gpu``, keeping order.
+
+        Only meaningful when a device is available; callers without one run every
+        spec on the main thread rather than splitting.
+        """
+        gpu: list[FeatureSpec] = []
+        cpu: list[FeatureSpec] = []
+        for ft in features:
+            (gpu if ft.support_gpu else cpu).append(ft)
+        return gpu, cpu
+
 
 @dataclass(frozen=True)
 class ModelSpec:
@@ -582,9 +440,6 @@ class LokyStackerV10Base(BaseClassifier):
         "rdst-p-ridgecv",
     ]
     STACKING_MODEL = "probability-ridgecv"
-    # Class-level default so every estimator has the attribute; ``TSCGlueEnhancedV4``
-    # promotes it to a constructor parameter. Read via the instance so a subclass that
-    # exposes it as a real parameter shadows this.
     prune_constant: bool = False
 
     def _get_feature_names(self, model_name: str) -> tuple[str, ...]:
@@ -742,32 +597,10 @@ class LokyStackerV10Base(BaseClassifier):
 
     # ----------------- utils -----------------
 
-    @property
-    def _device(self) -> str:
-        return "cuda" if self.n_gpus != 0 else "cpu"
-
     def _feature_device(self, ft: FeatureSpec) -> str:
         """Device a feature transformer is built for."""
-        return self._device if ft.support_gpu else "cpu"
+        return "cuda" if self.n_gpus != 0 and ft.support_gpu else "cpu"
 
-    def _split_feature_lanes(self) -> tuple[list[FeatureSpec], list[FeatureSpec]]:
-        """``features_list`` split into (device lane, cpu lane) on ``support_gpu``.
-
-        The device lane runs sequentially in one background thread while the cpu lane
-        runs on the main thread, so both processors are busy at once. Lane order is
-        ``features_list`` order, which puts the cheap hydra transform ahead of the
-        foundation models on every preset -- it releases its device memory before they
-        allocate. Without a GPU the device lane is empty and everything runs on the
-        main thread.
-        """
-        use_gpu = self._device != "cpu"
-
-        def on_device(ft) -> bool:
-            return use_gpu and ft.support_gpu
-
-        return [ft for ft in self.features_list if on_device(ft)], [
-            ft for ft in self.features_list if not on_device(ft)
-        ]
 
     def _get_feature_seed(self) -> int:
         return int(self.feature_seed.integers(0, 2**31 - 1, dtype=np.int32))
@@ -959,19 +792,9 @@ class LokyStackerV10Base(BaseClassifier):
     # ----------------- features: train transformers + compute arrays -----------------
 
     def fit_transform_features(self, X: np.ndarray, fit_start_time=None) -> None:
-        """Fit transformers and compute features.
-
-        When a GPU is available, ``support_gpu`` features run in a background thread
-        while the rest run on the main thread, so both processors are used
-        simultaneously. When no GPU is available all features run sequentially on the
-        main thread.
-        """
         os.makedirs(self._model_dir, exist_ok=True)
         directory = str(self._tmpdir)
         X_path = str(self._tmpdir / "X.npy")
-
-        gpu_features, cpu_features = self._split_feature_lanes()
-        gpu_error: list[BaseException] = []
 
         def _log_feature(ft, t0):
             Xt = read_array(f"Xt_{ft.get_feature_id()}", directory)
@@ -1028,6 +851,14 @@ class LokyStackerV10Base(BaseClassifier):
                 )
             _log_feature(ft, t0)
 
+        if self.n_gpus == 0:
+            for ft in self.features_list:
+                _fit_one(ft)
+            return
+
+        gpu_features, cpu_features = FeatureSpec.split_lanes(self.features_list)
+        gpu_error: list[BaseException] = []
+
         def _run_gpu_queue():
             try:
                 for ft in gpu_features:
@@ -1048,9 +879,6 @@ class LokyStackerV10Base(BaseClassifier):
     def compute_features(self, X: np.ndarray, directory: str, start_time=None) -> None:
         compute_start = perf_counter()
         X_path = f"{directory}/X.npy"
-
-        gpu_features, cpu_features = self._split_feature_lanes()
-        gpu_error: list[BaseException] = []
 
         def _log_feature(ft, t0):
             Xt = read_array(f"Xt_{ft.get_feature_id()}", directory)
@@ -1086,6 +914,14 @@ class LokyStackerV10Base(BaseClassifier):
                     self.compute_dtype,
                 )
             _log_feature(ft, t0)
+
+        if self.n_gpus == 0:
+            for ft in self.features_list:
+                _transform_one(ft)
+            return
+
+        gpu_features, cpu_features = FeatureSpec.split_lanes(self.features_list)
+        gpu_error: list[BaseException] = []
 
         def _run_gpu_queue():
             try:
@@ -1540,17 +1376,6 @@ class LokyStackerV10Base(BaseClassifier):
                 _, classes = int(meta[0]), list(meta[1:])
                 schema = [f"{model_name}|{cls}" for cls in classes]
                 frames.append(pl.DataFrame(prob_array, schema=schema))
-        return pl.DataFrame() if not frames else pl.concat(frames, how="horizontal")
-
-    def get_features(self) -> pl.DataFrame:
-        d = self._get_training_dir()
-        frames = []
-        for f in sorted(os.listdir(d)):
-            if f.startswith("Xt_") and f.endswith(".npy") and f != "Xt_probabilities.npy":
-                key = f[3:-4]
-                arr = read_array(f[:-4], d)
-                schema = [f"{key}|{i}" for i in range(arr.shape[1])]
-                frames.append(pl.DataFrame(arr, schema=schema))
         return pl.DataFrame() if not frames else pl.concat(frames, how="horizontal")
 
     def summary(self, return_transforms: bool = False) -> list[dict]:

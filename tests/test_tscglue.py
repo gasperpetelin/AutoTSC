@@ -9,6 +9,7 @@ from sklearn.metrics import accuracy_score
 
 from tscglue import utils
 from tscglue.models import (
+    FeatureSpec,
     TSCGlueClassifier,
     get_feature_transformer,
 )
@@ -254,7 +255,10 @@ def test_hydra_transformer_is_device_routed():
 
 
 def _lane_names(model):
-    gpu_features, cpu_features = model._split_feature_lanes()
+    """Effective lanes, mirroring the callers: no device means no split at all."""
+    if model.n_gpus == 0:
+        return [], [ft.feature_name for ft in model.features_list]
+    gpu_features, cpu_features = FeatureSpec.split_lanes(model.features_list)
     return [ft.feature_name for ft in gpu_features], [ft.feature_name for ft in cpu_features]
 
 

@@ -188,6 +188,45 @@ class AutoSelectKBestClassifier(BaseEstimator, ClassifierMixin):
         return self.classifier_.predict_proba(X)
 
 
+class RareClassSafeLogisticCV(BaseEstimator, ClassifierMixin):
+    def __init__(self, Cs=10, fixed_C=1.0, solver="lbfgs", max_iter=1000, class_weight=None):
+        self.Cs = Cs
+        self.fixed_C = fixed_C
+        self.solver = solver
+        self.max_iter = max_iter
+        self.class_weight = class_weight
+
+    def fit(self, X, y):
+        from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
+
+        min_count = int(np.unique(y, return_counts=True)[1].min())
+        if min_count < 2:
+            # A singleton class would make the internal CV crash; skip it.
+            self.estimator_ = LogisticRegression(
+                C=self.fixed_C,
+                solver=self.solver,
+                max_iter=self.max_iter,
+                class_weight=self.class_weight,
+            )
+        else:
+            # Identical to the original stacker: default cv=5, multinomial.
+            self.estimator_ = LogisticRegressionCV(
+                Cs=self.Cs,
+                solver=self.solver,
+                max_iter=self.max_iter,
+                class_weight=self.class_weight,
+            )
+        self.estimator_.fit(X, y)
+        self.classes_ = self.estimator_.classes_
+        return self
+
+    def predict(self, X):
+        return self.estimator_.predict(X)
+
+    def predict_proba(self, X):
+        return self.estimator_.predict_proba(X)
+
+
 class ClippedRegressor(BaseEstimator, RegressorMixin):
     """Wrap a regressor and clip predictions to the training target range.
 
