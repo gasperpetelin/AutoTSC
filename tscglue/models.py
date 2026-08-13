@@ -546,6 +546,7 @@ class LokyStackerV10Base(BaseClassifier):
         n_gpus=0,
         runs_dir=None,
         eval_metric="accuracy",
+        predict_batch_size=None,
     ):
         super().__init__()
         self.k_folds = int(k_folds)
@@ -562,6 +563,11 @@ class LokyStackerV10Base(BaseClassifier):
         self.selection = selection
         self.runs_dir = runs_dir
         self.eval_metric = eval_metric
+        assert predict_batch_size is None or predict_batch_size > 0, (
+            f"predict_batch_size must be positive; got {predict_batch_size}"
+        )
+        self.predict_batch_size = predict_batch_size
+        self._batch_for_call = None
 
         self.cv_splits = None
         self.feature_seed = np.random.default_rng(random_state)
@@ -605,6 +611,12 @@ class LokyStackerV10Base(BaseClassifier):
 
     def _get_feature_seed(self) -> int:
         return int(self.feature_seed.integers(0, 2**31 - 1, dtype=np.int32))
+
+    def _resolve_batch_size(self, per_call) -> int | None:
+        bs = self.predict_batch_size if per_call is None else per_call
+        if bs is not None and bs <= 0:
+            raise ValueError(f"predict_batch_size must be positive; got {bs}")
+        return bs
 
     def _require_tmpdir(self) -> Path:
         if self._tmpdir is None:
@@ -669,16 +681,43 @@ class LokyStackerV10Base(BaseClassifier):
 
     # ----------------- aeon API -----------------
 
+    # aeon marks these typing.final, but its _predict/_predict_proba hooks take X alone,
+    # so overriding is the only way through for a per-call argument.
+    def predict_proba(self, X, predict_batch_size=None):
+        self._batch_for_call = predict_batch_size
+        try:
+            return super().predict_proba(X)
+        finally:
+            self._batch_for_call = None
+
+    def predict(self, X, predict_batch_size=None):
+        self._batch_for_call = predict_batch_size
+        try:
+            return super().predict(X)
+        finally:
+            self._batch_for_call = None
+
+    @staticmethod
+    def _in_batches(fn, X, batch_size):
+        n_samples = X.shape[0]
+        if batch_size is None or batch_size >= n_samples:
+            return fn(X)
+        return np.concatenate(
+            [fn(X[start : start + batch_size]) for start in range(0, n_samples, batch_size)]
+        )
+
     def _predict_proba(self, X):
+        batch_size = self._resolve_batch_size(self._batch_for_call)
         if self._fallback_path.exists():
             fallback = read_model("fallback", str(self._model_dir))
-            return fallback.predict_proba(X)
-        return self.predict_proba_per_model(X)[self.best_model]
+            return self._in_batches(fallback.predict_proba, X, batch_size)
+        return self.predict_proba_per_model(X, predict_batch_size=batch_size)[self.best_model]
 
     def _predict(self, X):
         if self._fallback_path.exists():
             fallback = read_model("fallback", str(self._model_dir))
-            return fallback.predict(X)
+            batch_size = self._resolve_batch_size(self._batch_for_call)
+            return self._in_batches(fallback.predict, X, batch_size)
         probas = self._predict_proba(X)
         return self.classes_[np.argmax(probas, axis=1)]
 
@@ -1353,11 +1392,12 @@ class LokyStackerV10Base(BaseClassifier):
 
     # ----------------- inference -----------------
 
-    def predict_proba_per_model(self, X: np.ndarray) -> dict[str, np.ndarray]:
-        predict_start = perf_counter()
-        log("Starting prediction", level=1, start_time=predict_start, verbose=self.verbose)
+    def _predict_proba_batch(self, X: np.ndarray, executor, predict_start) -> dict[str, np.ndarray]:
+        """One full pass of the predict pipeline over ``X``.
 
-        mp_ctx = multiprocessing.get_context("forkserver")
+        Batch-local: ``predictions`` holds row indices relative to ``X``, and the feature
+        files are removed before returning.
+        """
         features_infer = self._base_dir / "features_inference"
         features_stack = self._base_dir / "features"
 
@@ -1365,127 +1405,116 @@ class LokyStackerV10Base(BaseClassifier):
         self._tmpdir = features_infer
 
         try:
-            with ProcessPoolExecutor(max_workers=self.n_jobs, mp_context=mp_ctx) as executor:
-                warm = [executor.submit(_noop) for _ in range(self.n_jobs)]
+            # compute features (transform-only; transformers already trained)
+            save_array(X, "X", str(features_infer), dtype=self.compute_dtype)
+            self.compute_features(X, str(features_infer), start_time=predict_start)
+            log(
+                "Computed and saved features for prediction", level=1, start_time=predict_start,
+                verbose=self.verbose,
+            )
 
-                # compute features (transform-only; transformers already trained)
-                save_array(X, "X", str(features_infer), dtype=self.compute_dtype)
-                self.compute_features(X, str(features_infer), start_time=predict_start)
-                log(
-                    "Computed and saved features for prediction", level=1, start_time=predict_start,
-                    verbose=self.verbose,
-                )
-
-                predictions = []
-                # ---- level 0 predictions ----
-                tasks = []
-                for spec in self.model_specs:
-                    for fold in range(self.k_folds * spec.n_repetitions):
-                        tasks.append(
-                            (
-                                spec.get_model_id(),
-                                spec.model_name,
-                                str(features_infer),
-                                list(spec.features),
-                                str(self._model_dir),
-                                fold,
-                            )
+            predictions = []
+            # ---- level 0 predictions ----
+            tasks = []
+            for spec in self.model_specs:
+                for fold in range(self.k_folds * spec.n_repetitions):
+                    tasks.append(
+                        (
+                            spec.get_model_id(),
+                            spec.model_name,
+                            str(features_infer),
+                            list(spec.features),
+                            str(self._model_dir),
+                            fold,
                         )
-
-                log(
-                    f"Starting prediction with {self.n_jobs} workers for {len(tasks)} first-level models",
-                    level=1,
-                    start_time=predict_start,
-                    verbose=self.verbose,
-                )
-
-                futures = {executor.submit(_predict_one_model_v10, *t): t for t in tasks}
-                for future in as_completed(futures):
-                    task = futures[future]
-                    model_id_task = task[0]
-                    try:
-                        proba, classes_, predict_dur, model_id_res = future.result()
-                    except Exception as e:
-                        raise RuntimeError(
-                            f"Worker failed during prediction {model_id_task}: {e}"
-                        ) from e
-
-                    log(
-                        f"Predicted {model_id_res} in {predict_dur:.4f}s",
-                        level=2,
-                        start_time=predict_start,
-                        verbose=self.verbose,
-                    )
-                    predictions.extend(
-                        self.add_probabilities(proba, classes_, model_id_res, level=0)
                     )
 
-                log(
-                    "Completed all first-level model predictions", level=1, start_time=predict_start,
-                    verbose=self.verbose,
-                )
+            log(
+                f"Starting prediction with {self.n_jobs} workers for {len(tasks)} first-level models",
+                level=1,
+                start_time=predict_start,
+                verbose=self.verbose,
+            )
 
-                # ---- build stacking matrix ----
-                if features_infer.exists():
-                    shutil.rmtree(features_infer)
-                os.makedirs(features_stack, exist_ok=True)
-                self._tmpdir = features_stack
-
-                if self._probability_columns is None:
+            futures = {executor.submit(_predict_one_model_v10, *t): t for t in tasks}
+            for future in as_completed(futures):
+                task = futures[future]
+                model_id_task = task[0]
+                try:
+                    proba, classes_, predict_dur, model_id_res = future.result()
+                except Exception as e:
                     raise RuntimeError(
-                        "Probability column metadata missing. Fit the model before predicting."
-                    )
-                prob_array = self._aggregate_prediction_matrix(
-                    predictions=predictions,
-                    n_samples=X.shape[0],
-                    probability_columns=self._probability_columns,
-                )
-
-                save_array(X, "X", str(features_stack), dtype=self.compute_dtype)
-                save_array(prob_array, "Xt_probabilities", str(features_stack))
-
-                # ---- stacking predictions ----
-                stack_tasks = []
-                for model_name in self.stacking_models:
-                    for fold in range(self.k_folds):
-                        stack_tasks.append(
-                            (
-                                model_name,  # model_id = model_name for stacking
-                                model_name,
-                                str(features_stack),
-                                [FeatureSpec(feature_name="probabilities")],
-                                str(self._model_dir),
-                                fold,
-                            )
-                        )
+                        f"Worker failed during prediction {model_id_task}: {e}"
+                    ) from e
 
                 log(
-                    f"Starting prediction with {self.n_jobs} workers for {len(stack_tasks)} stacking models",
-                    level=1,
+                    f"Predicted {model_id_res} in {predict_dur:.4f}s",
+                    level=2,
                     start_time=predict_start,
                     verbose=self.verbose,
                 )
+                predictions.extend(self.add_probabilities(proba, classes_, model_id_res, level=0))
 
-                futures = {executor.submit(_predict_one_model_v10, *t): t for t in stack_tasks}
-                for future in as_completed(futures):
-                    task = futures[future]
-                    model_id_task = task[0]
-                    try:
-                        proba, classes_, predict_dur, model_id_res = future.result()
-                    except Exception as e:
-                        raise RuntimeError(
-                            f"Worker failed during stacking prediction {model_id_task}: {e}"
-                        ) from e
+            log(
+                "Completed all first-level model predictions", level=1, start_time=predict_start,
+                verbose=self.verbose,
+            )
 
-                    log(
-                        f"Predicted {model_id_res} in {predict_dur:.4f}s",
-                        level=2,
-                        start_time=predict_start,
-                        verbose=self.verbose,
+            # ---- build stacking matrix ----
+            if features_infer.exists():
+                shutil.rmtree(features_infer)
+            os.makedirs(features_stack, exist_ok=True)
+            self._tmpdir = features_stack
+
+            prob_array = self._aggregate_prediction_matrix(
+                predictions=predictions,
+                n_samples=X.shape[0],
+                probability_columns=self._probability_columns,
+            )
+
+            save_array(X, "X", str(features_stack), dtype=self.compute_dtype)
+            save_array(prob_array, "Xt_probabilities", str(features_stack))
+
+            # ---- stacking predictions ----
+            stack_tasks = []
+            for model_name in self.stacking_models:
+                for fold in range(self.k_folds):
+                    stack_tasks.append(
+                        (
+                            model_name,  # model_id = model_name for stacking
+                            model_name,
+                            str(features_stack),
+                            [FeatureSpec(feature_name="probabilities")],
+                            str(self._model_dir),
+                            fold,
+                        )
                     )
-                    predictions.extend(
-                        self.add_probabilities(proba, classes_, model_id_res, level=1)
-                    )
+
+            log(
+                f"Starting prediction with {self.n_jobs} workers for {len(stack_tasks)} stacking models",
+                level=1,
+                start_time=predict_start,
+                verbose=self.verbose,
+            )
+
+            futures = {executor.submit(_predict_one_model_v10, *t): t for t in stack_tasks}
+            for future in as_completed(futures):
+                task = futures[future]
+                model_id_task = task[0]
+                try:
+                    proba, classes_, predict_dur, model_id_res = future.result()
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Worker failed during stacking prediction {model_id_task}: {e}"
+                    ) from e
+
+                log(
+                    f"Predicted {model_id_res} in {predict_dur:.4f}s",
+                    level=2,
+                    start_time=predict_start,
+                    verbose=self.verbose,
+                )
+                predictions.extend(self.add_probabilities(proba, classes_, model_id_res, level=1))
 
             log(
                 "Completed all stacking model predictions", level=1, start_time=predict_start,
@@ -1509,13 +1538,68 @@ class LokyStackerV10Base(BaseClassifier):
                 if d.exists():
                     shutil.rmtree(d)
             self._tmpdir = None
+
+    def predict_proba_per_model(
+        self, X: np.ndarray, predict_batch_size=None
+    ) -> dict[str, np.ndarray]:
+        """Per-model probabilities, optionally a batch of cases at a time.
+
+        ``predict_batch_size`` caps how many cases are in flight through the whole
+        pipeline, so peak RAM and run-dir disk scale with the batch rather than with
+        ``len(X)``. Each batch re-pays the pipeline's fixed costs (a subprocess spawn per
+        subprocess-lane feature, a re-read of every fold-model pickle), so sizes belong in
+        the hundreds or thousands. Results are not bit-reproducible across batch sizes --
+        hydra is convolved in float32, putting the heads it feeds at ~1e-10 in probability.
+        """
+        predict_start = perf_counter()
+        log("Starting prediction", level=1, start_time=predict_start, verbose=self.verbose)
+
+        if self._probability_columns is None:
+            raise RuntimeError(
+                "Probability column metadata missing. Fit the model before predicting."
+            )
+
+        batch_size = self._resolve_batch_size(predict_batch_size)
+        n_samples = X.shape[0]
+        mp_ctx = multiprocessing.get_context("forkserver")
+
+        try:
+            # One executor for the whole call, so forkserver warmup is paid once.
+            with ProcessPoolExecutor(max_workers=self.n_jobs, mp_context=mp_ctx) as executor:
+                warm = [executor.submit(_noop) for _ in range(self.n_jobs)]
+
+                if batch_size is None or batch_size >= n_samples:
+                    return self._predict_proba_batch(X, executor, predict_start)
+
+                log(
+                    f"Predicting {n_samples} cases in batches of {batch_size}",
+                    level=1,
+                    start_time=predict_start,
+                    verbose=self.verbose,
+                )
+                out = None
+                for start in range(0, n_samples, batch_size):
+                    part = self._predict_proba_batch(
+                        X[start : start + batch_size], executor, predict_start
+                    )
+                    if out is None:
+                        out = {
+                            name: np.empty((n_samples, proba.shape[1]), dtype=proba.dtype)
+                            for name, proba in part.items()
+                        }
+                    for name, proba in part.items():
+                        out[name][start : start + len(proba)] = proba
+                    del part
+                return out
+
+        finally:
             log(
                 "Executor shutdown complete", level=1, start_time=predict_start,
                 verbose=self.verbose,
             )
 
-    def predict_per_model(self, X: np.ndarray) -> dict[str, np.ndarray]:
-        proba_per_model = self.predict_proba_per_model(X)
+    def predict_per_model(self, X: np.ndarray, predict_batch_size=None) -> dict[str, np.ndarray]:
+        proba_per_model = self.predict_proba_per_model(X, predict_batch_size=predict_batch_size)
         return {
             name: self.classes_[np.argmax(proba, axis=1)] for name, proba in proba_per_model.items()
         }
@@ -1653,6 +1737,7 @@ class TSCGlueEnhancedV3(LokyStackerV10Base):
         eval_metric="accuracy",
         preset="medium",
         compute_dtype=None,
+        predict_batch_size=None,
     ):
         assert n_gpus in (0, 1, -1), f"n_gpus must be 0, 1, or -1; got {n_gpus}"
         assert eval_metric in _VALID_EVAL_METRICS, (
@@ -1688,6 +1773,7 @@ class TSCGlueEnhancedV3(LokyStackerV10Base):
             stacking_models=stacking_models,
             eval_metric=eval_metric,
             compute_dtype=compute_dtype,
+            predict_batch_size=predict_batch_size,
         )
 
     def _mean_members(self, pool=None) -> list[str]:
@@ -1725,7 +1811,8 @@ class TSCGlueEnhancedV3(LokyStackerV10Base):
         mean_pools = self._mean_pools()
         if self._fallback_path.exists() or self.best_model not in mean_pools:
             return super()._predict_proba(X)
-        probas = self.predict_proba_per_model(X)
+        batch_size = self._resolve_batch_size(self._batch_for_call)
+        probas = self.predict_proba_per_model(X, predict_batch_size=batch_size)
         return np.mean([probas[m] for m in mean_pools[self.best_model]], axis=0)
 
     def _fit_fallback(self, X, y, fit_start_time):
@@ -1756,6 +1843,7 @@ class TSCGlueEnhancedV4(TSCGlueEnhancedV3):
         preset="medium",
         prune_constant=True,
         compute_dtype=None,
+        predict_batch_size=None,
     ):
         super().__init__(
             random_state=random_state,
@@ -1768,6 +1856,7 @@ class TSCGlueEnhancedV4(TSCGlueEnhancedV3):
             eval_metric=eval_metric,
             preset=preset,
             compute_dtype=compute_dtype,
+            predict_batch_size=predict_batch_size,
         )
         self.prune_constant = prune_constant
 

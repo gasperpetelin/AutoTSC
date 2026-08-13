@@ -150,6 +150,97 @@ def test_label_dtype(encode_labels):
     assert accuracy <= 1.0, f"Accuracy {accuracy} is invalid (>1.0)"
 
 
+# Hydra is convolved in float32, which does not reassociate identically across batch sizes,
+# so batching moves hydra-fed heads by ~1e-10. Labels must still match exactly.
+BATCH_PROBA_ATOL = 1e-6
+
+
+def test_predict_batching_matches_unbatched():
+    """A batched predict must agree with an unbatched one, head for head."""
+    X_train, y_train, X_test, _ = utils.load_dataset("Coffee")
+    assert len(X_test) % 9 != 0, "batch size must leave a ragged final batch"
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        model = TSCGlueClassifier(
+            random_state=0, k_folds=3, n_jobs=2, preset="low", runs_dir=tmp_dir
+        )
+        model.fit(X_train, y_train)
+
+        ref_per_model = model.predict_proba_per_model(X_test)
+        ref_proba = model.predict_proba(X_test)
+        ref_pred = model.predict(X_test)
+
+        batched_per_model = model.predict_proba_per_model(X_test, predict_batch_size=9)
+        batched_proba = model.predict_proba(X_test, predict_batch_size=9)
+        batched_pred = model.predict(X_test, predict_batch_size=9)
+        batched_labels = model.predict_per_model(X_test, predict_batch_size=9)
+
+        # a batch of one, and a batch larger than the whole collection
+        single = model.predict_proba(X_test, predict_batch_size=1)
+        oversized = model.predict_proba(X_test, predict_batch_size=10 * len(X_test))
+
+    assert set(batched_per_model) == set(ref_per_model)
+    for name, ref in ref_per_model.items():
+        got = batched_per_model[name]
+        assert got.shape == ref.shape, name
+        assert np.max(np.abs(got - ref)) < BATCH_PROBA_ATOL, name
+        assert np.array_equal(got.argmax(axis=1), ref.argmax(axis=1)), name
+        assert np.array_equal(batched_labels[name], model.classes_[ref.argmax(axis=1)]), name
+
+    assert np.max(np.abs(batched_proba - ref_proba)) < BATCH_PROBA_ATOL
+    assert np.max(np.abs(single - ref_proba)) < BATCH_PROBA_ATOL
+    assert np.array_equal(oversized, ref_proba)
+    assert np.array_equal(batched_pred, ref_pred)
+
+
+def test_predict_batch_size_from_constructor_and_per_call():
+    """The constructor sets the default; a per-call value applies to that call only."""
+    X_train, y_train, X_test, _ = utils.load_dataset("Coffee")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        model = TSCGlueClassifier(
+            random_state=0, k_folds=3, n_jobs=2, preset="low", runs_dir=tmp_dir,
+            predict_batch_size=9,
+        )
+        model.fit(X_train, y_train)
+
+        from_constructor = model.predict_proba(X_test)
+        from_call = model.predict_proba(X_test, predict_batch_size=9)
+
+        # a per-call value must not be written back to the estimator
+        model.predict_proba(X_test, predict_batch_size=3)
+        assert model.predict_batch_size == 9
+        assert model._batch_for_call is None
+        assert np.array_equal(model.predict_proba(X_test), from_constructor)
+
+        with pytest.raises(ValueError):
+            model.predict_proba(X_test, predict_batch_size=0)
+
+    assert np.array_equal(from_constructor, from_call)
+
+
+def test_predict_batching_on_fallback_path():
+    """A singleton class forces the fallback, which has its own batching loop."""
+    X_train, y_train = _make_classification_data(n_per_class=4, n_classes=3, seed=0)
+    X_test, _ = _make_classification_data(n_per_class=4, n_classes=3, seed=1)
+    y_train[-1] = 99  # singleton class -> fold training impossible -> fallback
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        model = TSCGlueClassifier(
+            random_state=0, k_folds=3, n_jobs=2, preset="low", runs_dir=tmp_dir
+        )
+        model.fit(X_train, y_train)
+        assert model._fallback_path.exists(), "expected the fallback to be fitted"
+
+        ref_proba = model.predict_proba(X_test)
+        ref_pred = model.predict(X_test)
+        batched_proba = model.predict_proba(X_test, predict_batch_size=5)
+        batched_pred = model.predict(X_test, predict_batch_size=5)
+
+    assert np.max(np.abs(batched_proba - ref_proba)) < BATCH_PROBA_ATOL
+    assert np.array_equal(batched_pred, ref_pred)
+
+
 def test_high_preset_shares_feature_specs():
     """Both heads of each representation must reuse the identical cached feature (same seed)."""
     with tempfile.TemporaryDirectory() as tmp_dir:
